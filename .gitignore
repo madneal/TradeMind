@@ -1,3 +1,7 @@
 target
 .idea
 *.log
+
+# Added by cargo
+
+/target
