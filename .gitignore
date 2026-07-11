@@ -1,7 +1,33 @@
-target
-.idea
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+.env
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Data caches
+*.db
+*.sqlite
+*.sqlite3
+.cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Logs
 *.log
 
-# Added by cargo
-
-/target
+# OS
+.DS_Store

@@ -1,0 +1,26 @@
+[project]
+name = "trademind"
+version = "0.1.0"
+description = "A stock analysis agent for A-share market"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "zhipuai>=2.1.0",
+    "akshare>=1.14.0",
+    "pandas>=2.2.0",
+    "pandas-ta>=0.3.14b",
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    "python-dotenv>=1.0.0",
+    "sniffio>=1.3.0",
+]
+
+[project.scripts]
+trademind = "cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent", "tools", "data"]
