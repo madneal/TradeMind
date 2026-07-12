@@ -48,9 +48,10 @@ def _calc(df, indicators: list[str]) -> dict:
             bb = ta.bbands(close, length=20, std=2)
             if bb is not None and not bb.empty:
                 last = bb.iloc[-1]
-                result["BOLL_UPPER"] = round(float(last.iloc[0]), 3)
+                # pandas-ta 列顺序: BBL(下轨) BBM(中轨) BBU(上轨) BBB(带宽) BBP(%B)
+                result["BOLL_LOWER"] = round(float(last.iloc[0]), 3)
                 result["BOLL_MID"] = round(float(last.iloc[1]), 3)
-                result["BOLL_LOWER"] = round(float(last.iloc[2]), 3)
+                result["BOLL_UPPER"] = round(float(last.iloc[2]), 3)
     return result
 
 
