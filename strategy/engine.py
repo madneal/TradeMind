@@ -50,6 +50,7 @@ class Decision:
     tech_score: int
     reasons: list[str] = field(default_factory=list)
     rule_signals: list[dict] = field(default_factory=list)
+    execution: dict = field(default_factory=dict)
     context: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -434,6 +435,32 @@ def evaluate_code(
         if pnl_pct is None and cost_val:
             pnl_pct = (mkt_val - cost_val) / cost_val * 100
 
+    from strategy.execution import build_execution
+
+    exec_plan = build_execution(
+        action=final,
+        held=held,
+        shares=shares if held else 0,
+        weight_pct=weight_pct,
+        price=float(price) if price is not None else None,
+        is_st=is_st,
+        force_reduce=force_reduce,
+        fund_level=str(fund_level),
+        tech_action=tech_action,
+        pnl_pct=pnl_pct,
+    )
+    rule_signals.append(
+        RuleSignal(
+            "E1_EXECUTION",
+            "执行计划",
+            final if final in ("买入", "卖出", "减仓", "加仓") else "观望",
+            _vote(final),
+            exec_plan.price_hint
+            + (f"；建议 {exec_plan.side} {exec_plan.shares} 股（{exec_plan.ratio:.0%}）"
+               if exec_plan.shares else f"；{exec_plan.side}"),
+        )
+    )
+
     return Decision(
         code=code,
         name=name,
@@ -443,6 +470,7 @@ def evaluate_code(
         tech_score=tech_score,
         reasons=reasons,
         rule_signals=[s.to_dict() for s in rule_signals],
+        execution=exec_plan.to_dict(),
         context={
             "held": held,
             "shares": shares,
@@ -455,7 +483,7 @@ def evaluate_code(
             "force_reduce": force_reduce,
             "fund_level": fund_level,
             "fundamentals": fund.to_dict(),
-            "disclaimer": "规则信号仅供参考，不构成投资建议",
+            "disclaimer": "规则信号与执行计划仅供参考，不构成投资建议",
         },
     )
 

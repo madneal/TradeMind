@@ -242,10 +242,22 @@ def signals_cmd(
                 break
         d = evaluate_code(code, held=held, shares=shares, cost_price=cost, days=days)
         style = _action_style(d.action)
+        ex = d.execution or {}
+        exec_lines = ""
+        if ex:
+            exec_lines = (
+                f"\n\n[bold]执行计划[/bold]  {ex.get('side')}  "
+                f"{ex.get('shares', 0)} 股（约 {float(ex.get('ratio') or 0):.0%}）  "
+                f"紧急度：{ex.get('urgency')}\n"
+                f"价格：{ex.get('price_hint')}\n"
+            )
+            for b in ex.get("batches") or []:
+                exec_lines += f"  · 第{b.get('batch')}批 {b.get('shares')}股 | {b.get('when')} | {b.get('how')}\n"
         console.print(Panel(
             f"[{style}]动作：{d.action}[/{style}]  置信度：{d.confidence}  "
             f"现价：{d.price}  技术净分：{d.tech_score}\n\n"
-            + "\n".join(f"• {r}" for r in d.reasons),
+            + "\n".join(f"• {r}" for r in d.reasons)
+            + exec_lines,
             title=f"{d.code} {d.name}",
             border_style=style,
         ))
@@ -254,9 +266,9 @@ def signals_cmd(
         table.add_column("动作")
         table.add_column("理由")
         for s in d.rule_signals:
-            table.add_row(s["name"], s["action"], s["reason"])
+            table.add_row(s["name"], s["action"], s["reason"][:80])
         console.print(table)
-        console.print("[dim]规则信号不构成投资建议[/dim]")
+        console.print("[dim]规则信号与执行计划不构成投资建议[/dim]")
         return
 
     from strategy.engine import evaluate_portfolio
@@ -280,26 +292,34 @@ def signals_cmd(
     table.add_column("名称")
     table.add_column("现价", justify="right")
     table.add_column("动作", justify="center")
-    table.add_column("置信度", justify="center")
-    table.add_column("技术分", justify="right")
-    table.add_column("主要理由")
+    table.add_column("建议股数", justify="right")
+    table.add_column("比例", justify="right")
+    table.add_column("紧急", justify="center")
+    table.add_column("价格提示")
     for d in result["decisions"]:
         style = _action_style(d["action"])
-        reason = d["reasons"][0] if d.get("reasons") else ""
+        ex = d.get("execution") or {}
         table.add_row(
             d["code"],
-            d.get("name") or "",
+            (d.get("name") or "")[:8],
             f"{d['price']:.3f}" if d.get("price") else "-",
             f"[{style}]{d['action']}[/{style}]",
-            d.get("confidence") or "",
-            str(d.get("tech_score", "")),
-            reason[:60],
+            str(ex.get("shares", 0)),
+            f"{float(ex.get('ratio') or 0):.0%}",
+            str(ex.get("urgency") or "-"),
+            (ex.get("price_hint") or "-")[:36],
         )
     console.print(table)
 
     if result.get("sell_or_reduce"):
-        codes = ", ".join(f"{x['code']}({x['action']})" for x in result["sell_or_reduce"])
-        console.print(f"[red]优先处理（卖出/减仓）[/red]：{codes}")
+        console.print("[red bold]优先处理（含执行量）[/red bold]")
+        for x in result["sell_or_reduce"]:
+            ex = x.get("execution") or {}
+            console.print(
+                f"  [{_action_style(x['action'])}]{x['code']} {x.get('name','')}[/{_action_style(x['action'])}]  "
+                f"{x['action']} {ex.get('shares', 0)} 股（{float(ex.get('ratio') or 0):.0%}）  "
+                f"{ex.get('price_hint', '')}"
+            )
     if result.get("buy_or_add"):
         codes = ", ".join(f"{x['code']}({x['action']})" for x in result["buy_or_add"])
         console.print(f"[green]可考虑（买入/加仓）[/green]：{codes}")
