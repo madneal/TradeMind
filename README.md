@@ -30,4 +30,6 @@ uv run trademind chat "分析一下贵州茅台最近走势"  # 单次查询
 uv run trademind strategies          # 查看固定买卖规则
 uv run trademind signals             # 全持仓策略决策清单
 uv run trademind signals 518880      # 单票决策
+uv run trademind backtest 518880     # 单票历史回测（S5 技术规则）
+uv run trademind backtest            # 持仓分票回测汇总
 ```

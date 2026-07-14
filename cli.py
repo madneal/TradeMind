@@ -9,6 +9,8 @@
 - uv run trademind signals                     持仓固定策略买卖清单
 - uv run trademind signals 518880              单票策略决策
 - uv run trademind strategies                  列出固定策略规则
+- uv run trademind backtest 518880             单票历史回测（技术规则）
+- uv run trademind backtest                    持仓分票历史回测
 """
 
 import typer
@@ -114,6 +116,107 @@ def strategies_cmd():
             border_style="blue",
         ))
     console.print("[dim]规则信号不构成投资建议[/dim]")
+
+
+@app.command("backtest")
+def backtest_cmd(
+    code: str = typer.Argument(None, help="股票代码；不传则回测全部持仓（分票）"),
+    days: int = typer.Option(250, help="回测交易日大约数"),
+    fee_bps: float = typer.Option(5.0, help="单边手续费（基点）"),
+):
+    """用历史日 K 回测技术面 S5 规则（T 日信号，T+1 成交）。"""
+    from strategy.backtest import backtest_code, backtest_portfolio_codes
+    from portfolio import load_positions
+
+    if code:
+        console.print(f"[dim]回测 {code}，约 {days} 日，手续费 {fee_bps}bp…[/dim]")
+        try:
+            r = backtest_code(code, days=days, fee_bps=fee_bps)
+        except Exception as e:
+            console.print(f"[red]回测失败：{e}[/red]")
+            raise typer.Exit(1)
+        _print_backtest_one(r.to_dict())
+        return
+
+    positions = load_positions()
+    if not positions:
+        console.print("[yellow]持仓为空，请指定代码：trademind backtest 600418[/yellow]")
+        raise typer.Exit(1)
+    codes = [p.code for p in positions]
+    console.print(f"[dim]分票回测持仓 {len(codes)} 只，约 {days} 日…[/dim]")
+    out = backtest_portfolio_codes(codes, days=days, fee_bps=fee_bps)
+    s = out.get("summary") or {}
+    console.print(
+        f"样本 [cyan]{out['count']}[/cyan] 只 | "
+        f"策略均收益 [cyan]{s.get('avg_total_return', 0):.2%}[/cyan] | "
+        f"买入持有均收益 [cyan]{s.get('avg_buy_hold', 0):.2%}[/cyan] | "
+        f"超额均 [cyan]{s.get('avg_excess', 0):.2%}[/cyan] | "
+        f"跑赢买入持有 [green]{s.get('beat_buy_hold', 0)}[/green]/{out['count']}"
+    )
+    table = Table(title="分票回测（按超额收益排序）", show_lines=True)
+    table.add_column("代码")
+    table.add_column("名称")
+    table.add_column("策略收益", justify="right")
+    table.add_column("买入持有", justify="right")
+    table.add_column("超额", justify="right")
+    table.add_column("最大回撤", justify="right")
+    table.add_column("胜率", justify="right")
+    table.add_column("笔数", justify="right")
+    for r in out["results"]:
+        ex = r["excess_return"]
+        style = "green" if ex > 0 else "red"
+        table.add_row(
+            r["code"],
+            (r.get("name") or "")[:10],
+            f"{r['total_return']:.2%}",
+            f"{r['buy_hold_return']:.2%}",
+            f"[{style}]{ex:.2%}[/{style}]",
+            f"{r['max_drawdown']:.2%}",
+            f"{r['win_rate']:.1%}",
+            str(r["trades"]),
+        )
+    console.print(table)
+    if out.get("errors"):
+        console.print("[yellow]失败：[/yellow] " + ", ".join(
+            f"{e['code']}({e['error'][:40]})" for e in out["errors"]
+        ))
+    console.print(f"[dim]{out.get('disclaimer', '')}[/dim]")
+
+
+def _print_backtest_one(r: dict) -> None:
+    ex = r["excess_return"]
+    style = "green" if ex > 0 else "red"
+    console.print(Panel(
+        f"区间 [cyan]{r['start']}[/cyan] → [cyan]{r['end']}[/cyan]  ({r['bars']} 日)\n"
+        f"策略收益 [{style}]{r['total_return']:.2%}[/{style}]  |  "
+        f"买入持有 {r['buy_hold_return']:.2%}  |  "
+        f"超额 [{style}]{ex:.2%}[/{style}]\n"
+        f"最大回撤 {r['max_drawdown']:.2%}  |  "
+        f"交易 {r['trades']} 笔  |  胜率 {r['win_rate']:.1%}  |  "
+        f"仓位暴露 {r['exposure']:.1%}\n"
+        f"平均单笔 {r['avg_trade_return']:.2%}  |  手续费 {r['fee_bps']}bp",
+        title=f"回测 {r['code']} {r.get('name') or ''}",
+        border_style=style,
+    ))
+    if r.get("trade_list"):
+        table = Table(title="最近交易", show_lines=True)
+        table.add_column("买入日")
+        table.add_column("卖出日")
+        table.add_column("买价", justify="right")
+        table.add_column("卖价", justify="right")
+        table.add_column("收益", justify="right")
+        table.add_column("持有天", justify="right")
+        for t in r["trade_list"][-10:]:
+            rs = "green" if t["ret"] > 0 else "red"
+            table.add_row(
+                t["entry_date"], t["exit_date"],
+                f"{t['entry_price']:.3f}", f"{t['exit_price']:.3f}",
+                f"[{rs}]{t['ret']:.2%}[/{rs}]",
+                str(t["bars"]),
+            )
+        console.print(table)
+    for n in r.get("notes") or []:
+        console.print(f"[dim]• {n}[/dim]")
 
 
 @app.command("signals")
