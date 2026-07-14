@@ -262,10 +262,54 @@ def evaluate_code(
     rule_signals = list(tech_signals)
     reasons: list[str] = [s.reason for s in tech_signals if s.strategy_id == "S5_COMPOSITE"]
 
+    # ── F0 / F1 经营业绩与合规过滤 ──
+    from strategy.fundamentals import evaluate_fundamentals
+
+    fund = evaluate_fundamentals(code, name)
+    fund_level = fund.level
+    if fund.skip:
+        rule_signals.append(
+            RuleSignal("F0_COMPLIANCE", "合规与警示", "观望", 0, fund.reasons[0] if fund.reasons else "跳过")
+        )
+        rule_signals.append(
+            RuleSignal("F1_QUALITY", "业绩质量过滤", "观望", 0, "ETF/基金跳过业绩质量层")
+        )
+    else:
+        f0_action: Action = "禁止买入" if fund.forbid_buy and fund_level == "red" else "观望"
+        # 拆分展示：ST/退市进 F0，质量进 F1
+        f0_reasons = [r for r in fund.reasons if r.startswith("F0")]
+        f1_reasons = [r for r in fund.reasons if r.startswith("F1") or not r.startswith("F0")]
+        if not f0_reasons and not fund.skip:
+            f0_reasons = ["F0：未见退市类名称警示"]
+        rule_signals.append(
+            RuleSignal(
+                "F0_COMPLIANCE",
+                "合规与警示",
+                "禁止买入" if any("ST" in r or "退" in r for r in fund.reasons) else "观望",
+                -1 if any("ST" in r or "退" in r for r in fund.reasons) else 0,
+                "；".join(f0_reasons),
+            )
+        )
+        f1_act: Action = "禁止买入" if fund.forbid_buy else "观望"
+        if fund_level == "pass":
+            f1_act = "观望"
+        rule_signals.append(
+            RuleSignal(
+                "F1_QUALITY",
+                "业绩质量过滤",
+                f1_act,
+                -1 if fund.forbid_buy else 0,
+                "；".join(f1_reasons) if f1_reasons else "F1：无额外质量问题",
+            )
+        )
+        for r in fund.reasons:
+            if r not in reasons:
+                reasons.append(r)
+
     # ── 持仓纪律 ──
     force_reduce = False
-    forbid_buy = False
-    is_st = _is_st(name, code) or "ST" in name
+    forbid_buy = bool(fund.forbid_buy)
+    is_st = _is_st(name, code) or "ST" in (name or "")
 
     # P2 ST
     if is_st or "ST" in (name or ""):
@@ -354,18 +398,23 @@ def evaluate_code(
     elif tech_action == "买入" and forbid_buy:
         final = "观望"
         confidence = "中"
-        reasons.insert(0, "技术面偏多但纪律禁止买入/加仓")
+        if fund.forbid_buy:
+            reasons.insert(0, "技术面偏多但 F0/F1 或持仓纪律禁止买入/加仓")
+        else:
+            reasons.insert(0, "技术面偏多但纪律禁止买入/加仓")
     elif tech_action == "买入" and held and weight_pct < MAX_SINGLE_WEIGHT:
         final = "加仓"
         confidence = "中" if tech_score == 2 else "高"
-        reasons.insert(0, "技术面买入且仓位未超限 → 允许小幅加仓")
+        reasons.insert(0, "技术面买入且仓位/财务过滤通过 → 允许小幅加仓")
     elif tech_action == "买入" and not held:
         final = "买入"
         confidence = "中" if tech_score == 2 else "高"
-        reasons.insert(0, "技术面买入且未持有 → 允许建仓")
+        reasons.insert(0, "技术面买入且合规/质量过滤通过 → 允许建仓")
     else:
         final = "观望"
         confidence = "低" if tech_score == 0 else "中"
+        if fund_level == "unknown":
+            confidence = "低"
         if held:
             reasons.insert(0, "信号不足或冲突 → 持有观望")
         else:
@@ -374,7 +423,8 @@ def evaluate_code(
     rule_signals.append(
         RuleSignal(
             "D1_DECISION", "最终决策合成", final, _vote(final),
-            f"最终动作={final}（技术={tech_action}，净分={tech_score}，持仓={held}）",
+            f"最终动作={final}（技术={tech_action}，净分={tech_score}，"
+            f"财务={fund_level}，持仓={held}）",
         )
     )
 
@@ -403,6 +453,8 @@ def evaluate_code(
             "tech_action": tech_action,
             "forbid_buy": forbid_buy,
             "force_reduce": force_reduce,
+            "fund_level": fund_level,
+            "fundamentals": fund.to_dict(),
             "disclaimer": "规则信号仅供参考，不构成投资建议",
         },
     )

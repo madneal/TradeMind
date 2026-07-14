@@ -43,8 +43,46 @@ def _init_db() -> None:
             data_json TEXT NOT NULL,
             PRIMARY KEY (code)
         );
+        CREATE TABLE IF NOT EXISTS fund_cache (
+            code TEXT NOT NULL,
+            fetched_at REAL NOT NULL,
+            data_json TEXT NOT NULL,
+            PRIMARY KEY (code)
+        );
         """
     )
+    conn.close()
+
+
+# 财务指标缓存（季频数据，默认 7 天）
+FUND_TTL = 7 * 86400
+
+
+def get_fund_cache(code: str) -> dict | None:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT fetched_at, data_json FROM fund_cache WHERE code=?", (code,)
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return None
+    fetched_at, data_json = row
+    if time.time() - fetched_at > FUND_TTL:
+        return None
+    import json
+
+    return json.loads(data_json)
+
+
+def set_fund_cache(code: str, data: dict) -> None:
+    import json
+
+    conn = _get_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO fund_cache (code, fetched_at, data_json) VALUES (?,?,?)",
+        (code, time.time(), json.dumps(data, default=str)),
+    )
+    conn.commit()
     conn.close()
 
 

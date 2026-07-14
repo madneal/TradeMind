@@ -20,7 +20,7 @@ uv run trademind chat "分析一下贵州茅台最近走势"  # 单次查询
 ## 能力
 
 - **LLM**：默认 [xAI Grok](https://docs.x.ai)（`XAI_API_KEY` + `https://api.x.ai/v1`）
-- **固定策略决策**：均线 / MACD / RSI / 布林 + 持仓纪律 → 买入/卖出/观望
+- **固定策略决策**：均线 / MACD / RSI / 布林 + **经营质量过滤(F0/F1)** + 持仓纪律 → 买入/卖出/观望
 - **行情查询**：实时行情、历史 K 线
 - **技术指标**：MA / MACD / RSI / KDJ / BOLL
 - **持仓分析**：概览 / 盈亏 / 行业集中度
