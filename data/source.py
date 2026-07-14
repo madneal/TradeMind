@@ -43,16 +43,26 @@ def normalize_code(code: str) -> str:
 
 
 def _to_sina_symbol(code: str) -> str:
-    """6 位代码转新浪格式：6 开头沪市 sh，0/3 开头深市 sz，8/4 北交所 bj。"""
+    """6 位代码转新浪/腾讯市场前缀。
+
+    规则（常见 A 股 / 场内基金）：
+    - 沪市股票：60/68/90 → sh
+    - 深市股票：00/30/20 → sz
+    - 北交所：43/83/87/92 → bj
+    - 沪市 ETF/基金：51/56/58/50/52/11 等 → sh
+    - 深市 ETF/基金：15/16/17/18/12 等 → sz  （此前缺 15 导致黄金股/恒生科技等取价失败）
+    """
     code = normalize_code(code)
-    if code.startswith(("60", "68", "90")):
+    if code.startswith(("60", "68", "90", "51", "56", "58", "50", "52", "11")):
         return f"sh{code}"
-    elif code.startswith(("00", "30", "20")):
+    if code.startswith(("00", "30", "20", "15", "16", "17", "18", "12")):
         return f"sz{code}"
-    elif code.startswith(("43", "83", "87", "92")):
+    if code.startswith(("43", "83", "87", "92")):
         return f"bj{code}"
-    # 默认按沪市处理
-    return f"sh{code}"
+    # 兜底：5/6/9 开头偏沪，其余偏深
+    if code[0] in ("5", "6", "9"):
+        return f"sh{code}"
+    return f"sz{code}"
 
 
 def get_kline(
@@ -127,32 +137,36 @@ def _fetch_sina_quote(code: str) -> dict | None:
         )
         resp.encoding = "gbk"
         line = resp.text.strip()
-        # 格式: var hq_str_sh600519="名称,昨收,今开,当前价,最高,最低,...";
-        m = re.search(r'"(.+)"', line)
-        if not m:
-            return None
-        fields = m.group(1).split(",")
-        if len(fields) < 10:
-            return None
-        name = fields[0]
-        prev_close = float(fields[2])
-        open_p = float(fields[1])
-        price = float(fields[3])
-        high = float(fields[4])
-        low = float(fields[5])
-        volume = float(fields[8])
-        amount = float(fields[9])
-        pct_change = round((price - prev_close) / prev_close * 100, 2) if prev_close else None
-        change = round(price - prev_close, 2)
-        return {
-            "code": code, "name": name, "price": price, "open": open_p,
-            "high": high, "low": low, "prev_close": prev_close,
-            "volume": volume, "amount": amount,
-            "pct_change": pct_change, "change": change,
-            "source": "sina",
-        }
+        return _parse_sina_line(code, line)
     except Exception:
         return None
+
+
+def _parse_sina_line(code: str, line: str) -> dict | None:
+    """解析新浪单条行情字符串。"""
+    m = re.search(r'"(.+)"', line)
+    if not m:
+        return None
+    fields = m.group(1).split(",")
+    if len(fields) < 10:
+        return None
+    name = fields[0]
+    prev_close = float(fields[2])
+    open_p = float(fields[1])
+    price = float(fields[3])
+    high = float(fields[4])
+    low = float(fields[5])
+    volume = float(fields[8])
+    amount = float(fields[9])
+    pct_change = round((price - prev_close) / prev_close * 100, 2) if prev_close else None
+    change = round(price - prev_close, 2)
+    return {
+        "code": code, "name": name, "price": price, "open": open_p,
+        "high": high, "low": low, "prev_close": prev_close,
+        "volume": volume, "amount": amount,
+        "pct_change": pct_change, "change": change,
+        "source": "sina",
+    }
 
 
 def _fetch_tencent_quote(code: str) -> dict | None:
@@ -192,6 +206,87 @@ def _fetch_tencent_quote(code: str) -> dict | None:
         }
     except Exception:
         return None
+
+
+def get_quotes(codes: list[str]) -> list[dict]:
+    """批量获取实时行情（单次请求新浪，逗号分隔多代码）。
+
+    对个别失败的代码会降级到腾讯或 K 线，保证每只都有结果。
+    """
+    codes = [normalize_code(c) for c in codes]
+    if not codes:
+        return []
+
+    results: dict[str, dict] = {}
+
+    # 先查缓存
+    for code in codes:
+        cached = cache.get_quote_cache(code)
+        if cached is not None:
+            results[code] = cached
+
+    missing = [c for c in codes if c not in results]
+    if not missing:
+        return [results[c] for c in codes]
+
+    # 批量请求新浪（逗号分隔，一次搞定）
+    sina_symbols = ",".join(_to_sina_symbol(c) for c in missing)
+    try:
+        resp = _retry(
+            requests.get,
+            f"https://hq.sinajs.cn/list={sina_symbols}",
+            headers={"Referer": "https://finance.sina.com.cn"},
+            timeout=15,
+        )
+        resp.encoding = "gbk"
+        for line in resp.text.strip().split("\n"):
+            line = line.strip()
+            if not line or '=""' in line:
+                continue
+            # 从 var hq_str_sh600519="..." 中提取代码
+            m2 = re.match(r"var hq_str_(\w+)=", line)
+            if m2:
+                raw_sym = m2.group(1).lower()
+                code = re.sub(r"^(sh|sz|bj)", "", raw_sym)
+                parsed = _parse_sina_line(code, line)
+                if parsed and parsed.get("price") and parsed["price"] > 0:
+                    results[code] = parsed
+                    cache.set_quote_cache(code, parsed)
+    except Exception:
+        pass  # 降级到逐个请求
+
+    # 对仍然缺失的逐个降级
+    for code in missing:
+        if code in results:
+            continue
+        for fetcher in (_fetch_sina_quote, _fetch_tencent_quote):
+            data = fetcher(code)
+            if data and data.get("price") and data["price"] > 0:
+                results[code] = data
+                cache.set_quote_cache(code, data)
+                break
+        else:
+            # 最终降级：K 线收盘价
+            try:
+                df = get_kline(code, period="daily", days=1)
+                if not df.empty:
+                    r = df.iloc[-1]
+                    results[code] = {
+                        "code": code, "name": "", "price": float(r["close"]),
+                        "pct_change": float(r.get("pct_change", 0)) if pd.notna(r.get("pct_change")) else None,
+                        "change": float(r.get("change", 0)) if pd.notna(r.get("change")) else None,
+                        "volume": float(r.get("volume", 0)) if pd.notna(r.get("volume")) else None,
+                        "amount": float(r.get("amount", 0)) if pd.notna(r.get("amount")) else None,
+                        "high": float(r.get("high", 0)) if pd.notna(r.get("high")) else None,
+                        "low": float(r.get("low", 0)) if pd.notna(r.get("low")) else None,
+                        "open": float(r.get("open", 0)) if pd.notna(r.get("open")) else None,
+                        "date": str(pd.Timestamp(r["date"]).date()),
+                        "source": "kline_fallback",
+                    }
+            except Exception:
+                results[code] = {"code": code, "name": "", "price": None, "source": "failed"}
+
+    return [results.get(c, {"code": c, "price": None, "source": "missing"}) for c in codes]
 
 
 def get_quote(code: str) -> dict:

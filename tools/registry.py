@@ -19,7 +19,7 @@ class Tool:
     func: Callable[..., Any]
 
     def to_schema(self) -> dict:
-        """转为智谱 function calling 需要的 schema 格式。"""
+        """转为 OpenAI / xAI function calling 的 function 本体。"""
         return {
             "name": self.name,
             "description": self.description,

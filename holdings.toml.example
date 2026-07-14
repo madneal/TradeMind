@@ -1,0 +1,17 @@
+# TradeMind 持仓配置文件
+# 使用方法：cp holdings.toml.example holdings.toml，然后编辑填入你的持仓
+
+[[positions]]
+code = "600519"       # 股票代码（6 位数字）
+shares = 100         # 持仓股数
+cost_price = 1500.50 # 买入成本价（元/股）
+
+[[positions]]
+code = "000001"
+shares = 1000
+cost_price = 12.30
+
+[[positions]]
+code = "300750"
+shares = 200
+cost_price = 210.00

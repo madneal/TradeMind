@@ -21,6 +21,12 @@ build/
 *.sqlite3
 .cache/
 
+# Personal holdings (do not commit)
+holdings.toml
+
+# Personal notes / conversation logs (do not commit)
+notes/
+
 # IDE
 .idea/
 .vscode/

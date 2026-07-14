@@ -8,17 +8,19 @@ A 股票分析 Agent —— 基于 ReAct + function calling，用自然语言查
 # 1. 安装依赖
 uv sync
 
-# 2. 配置 API Key
+# 2. 配置 API Key（默认 xAI Grok）
 cp .env.example .env
-# 编辑 .env 填入智谱 API Key
+# 编辑 .env 填入 XAI_API_KEY（https://console.x.ai）
 
 # 3. 运行
-uv run trademind                      # 进入交互式对话
-uv run trademind "分析一下贵州茅台最近走势"  # 单次查询
+uv run trademind chat                      # 进入交互式对话
+uv run trademind chat "分析一下贵州茅台最近走势"  # 单次查询
 ```
 
 ## 能力
 
+- **LLM**：默认 [xAI Grok](https://docs.x.ai)（`XAI_API_KEY` + `https://api.x.ai/v1`）
 - **行情查询**：实时行情、历史 K 线
 - **技术指标**：MA / MACD / RSI / KDJ / BOLL
+- **持仓分析**：概览 / 盈亏 / 行业集中度
 - **交互**：CLI 多轮对话 + 单次查询

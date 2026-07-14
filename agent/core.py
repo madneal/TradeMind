@@ -50,14 +50,13 @@ def run(
             # 没有工具调用，说明 LLM 给出了最终回答
             return resp.content or "(无回答)"
 
-        # 把 assistant 的 tool_calls 消息加入历史
-        # 智谱要求把 tool_calls 附在 assistant 消息上
+        # 把 assistant 的 tool_calls 消息加入历史（OpenAI / xAI 格式）
         messages.append({
             "role": "assistant",
             "content": resp.content or "",
             "tool_calls": [
                 {
-                    "id": f"call_{i}",
+                    "id": tc.get("id") or f"call_{i}",
                     "type": "function",
                     "function": {
                         "name": tc["name"],
@@ -72,13 +71,14 @@ def run(
         for i, tc in enumerate(resp.tool_calls):
             name = tc["name"]
             args = tc["arguments"]
+            call_id = tc.get("id") or f"call_{i}"
             if on_tool_call:
                 on_tool_call(name, args)
             result = call_tool(name, args)
             messages.append({
                 "role": "tool",
                 "content": result,
-                "tool_call_id": f"call_{i}",
+                "tool_call_id": call_id,
             })
 
     # 超过最大迭代仍未完成

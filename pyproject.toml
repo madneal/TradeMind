@@ -5,7 +5,7 @@ description = "A stock analysis agent for A-share market"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "zhipuai>=2.1.0",
+    "openai>=1.60.0",
     "akshare>=1.14.0",
     "pandas>=2.2.0",
     "pandas-ta>=0.3.14b",
@@ -13,11 +13,8 @@ dependencies = [
     "rich>=13.7.0",
     "python-dotenv>=1.0.0",
     "sniffio>=1.3.0",
+    "tomli-w>=1.0.0",
 ]
-
-[tool.uv]
-# 强制提升 PyJWT 修复 CVE（zhipuai 锁死 <2.9.0，但 2.13 向后兼容，实际可正常运行）
-override-dependencies = ["pyjwt>=2.13.0"]
 
 [project.scripts]
 trademind = "cli:app"
