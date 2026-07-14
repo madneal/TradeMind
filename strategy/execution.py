@@ -79,15 +79,23 @@ def build_execution(
 
     # ── 持有 ──
     if action in ("观望", "禁止买入") or not held and action not in ("买入",):
+        if action == "观望" and held and pnl_pct is not None and pnl_pct < 0:
+            notes.append(
+                "成本纪律：浮亏中默认不主动卖；可挂「回本附近」条件单，"
+                "或等基本面破坏（财务红灯/ST）再破例减仓"
+            )
+            if price is not None and pnl_pct is not None:
+                # 无法知成本价时仅提示
+                notes.append("若设条件单：优先等到价≥成本再分批减，避免锁定亏损")
         if action == "观望" and held and pnl_pct is not None and pnl_pct <= -40:
-            notes.append("深套：不强制卖出；若反弹可自行减 20%～40%，禁止摊薄加仓")
+            notes.append("深套：禁止摊薄加仓；不强制市价砍仓")
         return ExecutionPlan(
             side="持有",
             ratio=0.0,
             shares=0,
             urgency="低",
             price_rule="none",
-            price_hint="无需挂单",
+            price_hint="无需挂单（浮亏持有或信号不足）",
             limit_price=None,
             batches=[],
             notes=notes,

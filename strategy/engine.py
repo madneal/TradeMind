@@ -16,6 +16,7 @@ from strategy.rules import (
     HARD_SINGLE_WEIGHT,
     MAX_SINGLE_WEIGHT,
     MAX_THEME_WEIGHT,
+    NO_LOSS_EXIT,
     RSI_OVERBOUGHT,
     RSI_OVERSOLD,
     ST_DAY_DROP,
@@ -380,6 +381,23 @@ def evaluate_code(
         )
         reasons.append(rule_signals[-1].reason)
 
+    if held and cost_price and price:
+        cost_val = cost_price * shares
+        mkt_val = float(price) * shares
+        if pnl_pct is None and cost_val:
+            pnl_pct = (mkt_val - cost_val) / cost_val * 100
+
+    # 是否浮亏（成本纪律用）
+    underwater = False
+    if held:
+        if pnl_pct is not None:
+            underwater = pnl_pct < 0
+        elif price is not None and cost_price and cost_price > 0:
+            underwater = float(price) < float(cost_price)
+
+    # 基本面破坏：允许在浮亏中破例卖出
+    fundamental_break = bool(is_st) or fund_level == "red"
+
     # ── 最终决策 ──
     final: Action
     confidence: str
@@ -421,19 +439,61 @@ def evaluate_code(
         else:
             reasons.insert(0, "信号不足 → 不操作")
 
+    # ── P5 成本纪律：浮亏不主动了结，除非基本面破坏 ──
+    if (
+        NO_LOSS_EXIT
+        and held
+        and underwater
+        and final in ("卖出", "减仓")
+        and not fundamental_break
+    ):
+        rule_signals.append(
+            RuleSignal(
+                "P5_NO_LOSS_EXIT",
+                "成本纪律（不亏本了结）",
+                "观望",
+                0,
+                f"浮亏中（pnl={pnl_pct if pnl_pct is not None else '价<成本'}）且基本面未破坏"
+                f"（财务={fund_level}，ST={is_st}）→ 不锁定亏损，改为观望；"
+                f"可待回本附近或基本面转红再卖",
+            )
+        )
+        reasons.insert(
+            0,
+            "成本纪律：浮亏且基本面未破坏 → 不主动卖出/减仓锁定亏损",
+        )
+        final = "观望"
+        confidence = "中"
+        force_reduce = False
+    elif NO_LOSS_EXIT and held and underwater and final in ("卖出", "减仓") and fundamental_break:
+        rule_signals.append(
+            RuleSignal(
+                "P5_NO_LOSS_EXIT",
+                "成本纪律（不亏本了结）",
+                final,
+                -1,
+                f"浮亏中，但基本面已破坏（财务={fund_level}，ST={is_st}）→ 允许破例{final}",
+            )
+        )
+        reasons.insert(0, "成本纪律破例：基本面破坏，允许浮亏减仓/卖出")
+    elif NO_LOSS_EXIT and held and not underwater:
+        rule_signals.append(
+            RuleSignal(
+                "P5_NO_LOSS_EXIT",
+                "成本纪律（不亏本了结）",
+                "观望",
+                0,
+                "当前未浮亏（价≥成本）→ 卖出不受成本纪律阻止",
+            )
+        )
+
     rule_signals.append(
         RuleSignal(
             "D1_DECISION", "最终决策合成", final, _vote(final),
             f"最终动作={final}（技术={tech_action}，净分={tech_score}，"
-            f"财务={fund_level}，持仓={held}）",
+            f"财务={fund_level}，浮亏={underwater}，持仓={held}）",
         )
     )
-
-    if held and cost_price and price:
-        cost_val = cost_price * shares
-        mkt_val = price * shares
-        if pnl_pct is None and cost_val:
-            pnl_pct = (mkt_val - cost_val) / cost_val * 100
 
     from strategy.execution import build_execution
 
