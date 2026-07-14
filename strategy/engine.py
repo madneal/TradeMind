@@ -503,6 +503,7 @@ def evaluate_code(
         shares=shares if held else 0,
         weight_pct=weight_pct,
         price=float(price) if price is not None else None,
+        cost_price=float(cost_price) if cost_price else None,
         is_st=is_st,
         force_reduce=force_reduce,
         fund_level=str(fund_level),
