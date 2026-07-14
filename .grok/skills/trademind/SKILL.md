@@ -34,6 +34,25 @@ cd /Users/neal/project/TradeMind && uv run python .grok/skills/trademind/scripts
 
 得到 JSON：`overview` / `pnl` / `risk`。
 
+### 1b. 固定策略买卖清单（决策必跑）
+
+用户问买卖/调仓时优先：
+
+```bash
+cd /Users/neal/project/TradeMind && uv run trademind signals
+# 或
+cd /Users/neal/project/TradeMind && uv run python .grok/skills/trademind/scripts/analyze.py --mode signals
+```
+
+单票：
+
+```bash
+uv run trademind signals 518880
+```
+
+规则说明：`uv run trademind strategies`  
+解读时以返回的 **action**（买入/加仓/卖出/减仓/观望）为准，并声明不构成投资建议。
+
 ### 2. 单票行情
 
 ```bash

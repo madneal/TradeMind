@@ -1,0 +1,494 @@
+"""策略引擎：对单票 / 全持仓输出固定规则下的买卖决策。"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from typing import Any, Literal
+
+import pandas as pd
+import pandas_ta as ta
+
+from strategy.rules import (
+    BOLL_TOUCH_RATIO,
+    DEEP_LOSS_PCT,
+    GOLD_THEME_CODES,
+    GOLD_THEME_NAME_KEYWORDS,
+    HARD_SINGLE_WEIGHT,
+    MAX_SINGLE_WEIGHT,
+    MAX_THEME_WEIGHT,
+    RSI_OVERBOUGHT,
+    RSI_OVERSOLD,
+    ST_DAY_DROP,
+    ST_MAX_WEIGHT,
+    STRATEGY_CATALOG,
+    TECH_BUY_SCORE,
+    TECH_SELL_SCORE,
+)
+
+Action = Literal["买入", "卖出", "观望", "减仓", "加仓", "禁止买入"]
+
+
+@dataclass
+class RuleSignal:
+    strategy_id: str
+    name: str
+    action: Action
+    score: int  # +1 买, -1 卖, 0 中性
+    reason: str
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class Decision:
+    code: str
+    name: str
+    price: float | None
+    action: Action
+    confidence: str  # 高 / 中 / 低
+    tech_score: int
+    reasons: list[str] = field(default_factory=list)
+    rule_signals: list[dict] = field(default_factory=list)
+    context: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def _vote(action: Action) -> int:
+    if action in ("买入", "加仓"):
+        return 1
+    if action in ("卖出", "减仓", "禁止买入"):
+        return -1
+    return 0
+
+
+def _is_st(name: str, code: str = "") -> bool:
+    """名称含 ST/*ST 即视为 ST（不按科创板代码误判）。"""
+    n = (name or "").replace(" ", "")
+    return "ST" in n.upper() or n.startswith("*ST")
+
+
+def _is_gold_theme(code: str, name: str, industry: str = "") -> bool:
+    if code in GOLD_THEME_CODES:
+        return True
+    text = f"{name}{industry}"
+    return any(k in text for k in GOLD_THEME_NAME_KEYWORDS)
+
+
+def _ma_signal(close: pd.Series) -> RuleSignal:
+    if len(close) < 20:
+        return RuleSignal("S1_MA_TREND", "均线趋势", "观望", 0, "K 线不足 20 日，跳过均线")
+    ma5 = float(close.rolling(5).mean().iloc[-1])
+    ma10 = float(close.rolling(10).mean().iloc[-1])
+    ma20 = float(close.rolling(20).mean().iloc[-1])
+    px = float(close.iloc[-1])
+    if ma5 > ma10 > ma20 and px > ma20:
+        return RuleSignal(
+            "S1_MA_TREND", "均线趋势", "买入", 1,
+            f"多头排列 MA5={ma5:.3f}>MA10={ma10:.3f}>MA20={ma20:.3f}，价{px:.3f}>MA20",
+        )
+    if ma5 < ma10 < ma20 and px < ma20:
+        return RuleSignal(
+            "S1_MA_TREND", "均线趋势", "卖出", -1,
+            f"空头排列 MA5={ma5:.3f}<MA10={ma10:.3f}<MA20={ma20:.3f}，价{px:.3f}<MA20",
+        )
+    return RuleSignal(
+        "S1_MA_TREND", "均线趋势", "观望", 0,
+        f"均线未形成明确排列 MA5={ma5:.3f}/MA10={ma10:.3f}/MA20={ma20:.3f}",
+    )
+
+
+def _macd_signal(close: pd.Series) -> RuleSignal:
+    if len(close) < 35:
+        return RuleSignal("S2_MACD", "MACD 动能", "观望", 0, "K 线不足，跳过 MACD")
+    macd = ta.macd(close, fast=12, slow=26, signal=9)
+    if macd is None or macd.empty:
+        return RuleSignal("S2_MACD", "MACD 动能", "观望", 0, "MACD 计算失败")
+    dif = float(macd.iloc[-1, 0])
+    dea = float(macd.iloc[-1, 1])
+    hist = float(macd.iloc[-1, 2])
+    if dif > dea and hist > 0:
+        return RuleSignal(
+            "S2_MACD", "MACD 动能", "买入", 1,
+            f"多头动能 DIF={dif:.4f}>DEA={dea:.4f}，HIST={hist:.4f}>0",
+        )
+    if dif < dea and hist < 0:
+        return RuleSignal(
+            "S2_MACD", "MACD 动能", "卖出", -1,
+            f"空头动能 DIF={dif:.4f}<DEA={dea:.4f}，HIST={hist:.4f}<0",
+        )
+    return RuleSignal(
+        "S2_MACD", "MACD 动能", "观望", 0,
+        f"动能不明确 DIF={dif:.4f}/DEA={dea:.4f}/HIST={hist:.4f}",
+    )
+
+
+def _rsi_signal(close: pd.Series) -> RuleSignal:
+    if len(close) < 20:
+        return RuleSignal("S3_RSI", "RSI 超买超卖", "观望", 0, "K 线不足，跳过 RSI")
+    rsi_s = ta.rsi(close, length=14)
+    if rsi_s is None or rsi_s.empty or pd.isna(rsi_s.iloc[-1]):
+        return RuleSignal("S3_RSI", "RSI 超买超卖", "观望", 0, "RSI 计算失败")
+    rsi = float(rsi_s.iloc[-1])
+    if rsi < RSI_OVERSOLD:
+        return RuleSignal(
+            "S3_RSI", "RSI 超买超卖", "买入", 1,
+            f"RSI14={rsi:.1f}<{RSI_OVERSOLD:.0f} 超卖区",
+        )
+    if rsi > RSI_OVERBOUGHT:
+        return RuleSignal(
+            "S3_RSI", "RSI 超买超卖", "卖出", -1,
+            f"RSI14={rsi:.1f}>{RSI_OVERBOUGHT:.0f} 超买区",
+        )
+    return RuleSignal(
+        "S3_RSI", "RSI 超买超卖", "观望", 0,
+        f"RSI14={rsi:.1f} 中性区",
+    )
+
+
+def _boll_signal(close: pd.Series) -> RuleSignal:
+    if len(close) < 25:
+        return RuleSignal("S4_BOLL", "布林带位置", "观望", 0, "K 线不足，跳过 BOLL")
+    bb = ta.bbands(close, length=20, std=2)
+    if bb is None or bb.empty:
+        return RuleSignal("S4_BOLL", "布林带位置", "观望", 0, "BOLL 计算失败")
+    # pandas-ta: BBL, BBM, BBU
+    lower = float(bb.iloc[-1, 0])
+    mid = float(bb.iloc[-1, 1])
+    upper = float(bb.iloc[-1, 2])
+    px = float(close.iloc[-1])
+    width = upper - lower
+    if width <= 0:
+        return RuleSignal("S4_BOLL", "布林带位置", "观望", 0, "布林带宽度为 0")
+    dist_low = (px - lower) / width
+    dist_up = (upper - px) / width
+    if dist_low <= BOLL_TOUCH_RATIO:
+        return RuleSignal(
+            "S4_BOLL", "布林带位置", "买入", 1,
+            f"价格{px:.3f}贴近下轨{lower:.3f}（距下轨比例{dist_low:.2f}）",
+        )
+    if dist_up <= BOLL_TOUCH_RATIO:
+        return RuleSignal(
+            "S4_BOLL", "布林带位置", "卖出", -1,
+            f"价格{px:.3f}贴近上轨{upper:.3f}（距上轨比例{dist_up:.2f}）",
+        )
+    return RuleSignal(
+        "S4_BOLL", "布林带位置", "观望", 0,
+        f"价格{px:.3f}在中轨附近 mid={mid:.3f}",
+    )
+
+
+def _technical_bundle(df: pd.DataFrame) -> tuple[list[RuleSignal], int, Action]:
+    close = df["close"]
+    signals = [
+        _ma_signal(close),
+        _macd_signal(close),
+        _rsi_signal(close),
+        _boll_signal(close),
+    ]
+    score = sum(s.score for s in signals)
+    if score >= TECH_BUY_SCORE:
+        action: Action = "买入"
+    elif score <= TECH_SELL_SCORE:
+        action = "卖出"
+    else:
+        action = "观望"
+    signals.append(
+        RuleSignal(
+            "S5_COMPOSITE",
+            "技术面合成",
+            action,
+            _vote(action),
+            f"S1~S4 净分={score}（买入阈值≥{TECH_BUY_SCORE}，卖出阈值≤{TECH_SELL_SCORE}）→ {action}",
+        )
+    )
+    return signals, score, action
+
+
+def evaluate_code(
+    code: str,
+    *,
+    held: bool = False,
+    shares: int = 0,
+    cost_price: float = 0.0,
+    weight_pct: float = 0.0,
+    pnl_pct: float | None = None,
+    pct_change: float | None = None,
+    name: str = "",
+    industry: str = "",
+    gold_theme_weight: float = 0.0,
+    days: int = 90,
+) -> Decision:
+    """对单只代码做固定策略评估。"""
+    from data.source import get_kline, get_quote, normalize_code
+
+    code = normalize_code(code)
+    quote: dict[str, Any] = {}
+    try:
+        quote = get_quote(code)
+    except Exception:
+        quote = {}
+    name = name or quote.get("name") or ""
+    price = quote.get("price")
+    if pct_change is None:
+        pct_change = quote.get("pct_change")
+
+    try:
+        df = get_kline(code, period="daily", days=days)
+    except Exception as e:
+        return Decision(
+            code=code,
+            name=name,
+            price=price,
+            action="观望",
+            confidence="低",
+            tech_score=0,
+            reasons=[f"无法获取 K 线：{e}"],
+            context={"error": str(e)},
+        )
+
+    if df is None or df.empty:
+        return Decision(
+            code=code, name=name, price=price, action="观望",
+            confidence="低", tech_score=0, reasons=["K 线为空"],
+        )
+
+    if price is None or not price:
+        price = float(df["close"].iloc[-1])
+
+    tech_signals, tech_score, tech_action = _technical_bundle(df)
+    rule_signals = list(tech_signals)
+    reasons: list[str] = [s.reason for s in tech_signals if s.strategy_id == "S5_COMPOSITE"]
+
+    # ── 持仓纪律 ──
+    force_reduce = False
+    forbid_buy = False
+    is_st = _is_st(name, code) or "ST" in name
+
+    # P2 ST
+    if is_st or "ST" in (name or ""):
+        st_reasons = []
+        if held and weight_pct > ST_MAX_WEIGHT:
+            force_reduce = True
+            st_reasons.append(f"ST 仓位 {weight_pct:.1f}% > {ST_MAX_WEIGHT}%")
+        if pct_change is not None and pct_change <= ST_DAY_DROP:
+            force_reduce = True
+            st_reasons.append(f"ST 单日跌幅 {pct_change}% ≤ {ST_DAY_DROP}%")
+        forbid_buy = True
+        action_st: Action = "减仓" if force_reduce else "禁止买入"
+        rule_signals.append(
+            RuleSignal(
+                "P2_ST", "ST 纪律", action_st, -1 if force_reduce else 0,
+                "；".join(st_reasons) if st_reasons else "ST/高风险标的：禁止加仓",
+            )
+        )
+        reasons.append(rule_signals[-1].reason)
+
+    # P1 weight
+    if held and weight_pct >= HARD_SINGLE_WEIGHT:
+        force_reduce = True
+        rule_signals.append(
+            RuleSignal(
+                "P1_WEIGHT", "单票仓位纪律", "减仓", -1,
+                f"仓位 {weight_pct:.1f}% ≥ 硬上限 {HARD_SINGLE_WEIGHT}% → 强烈减仓",
+            )
+        )
+        reasons.append(rule_signals[-1].reason)
+    elif held and weight_pct >= MAX_SINGLE_WEIGHT:
+        force_reduce = True
+        rule_signals.append(
+            RuleSignal(
+                "P1_WEIGHT", "单票仓位纪律", "减仓", -1,
+                f"仓位 {weight_pct:.1f}% ≥ {MAX_SINGLE_WEIGHT}% → 建议减仓",
+            )
+        )
+        reasons.append(rule_signals[-1].reason)
+    else:
+        rule_signals.append(
+            RuleSignal(
+                "P1_WEIGHT", "单票仓位纪律", "观望", 0,
+                f"仓位 {weight_pct:.1f}%（上限 {MAX_SINGLE_WEIGHT}%）",
+            )
+        )
+
+    # P3 deep loss
+    if held and pnl_pct is not None and pnl_pct <= DEEP_LOSS_PCT:
+        forbid_buy = True
+        rule_signals.append(
+            RuleSignal(
+                "P3_DEEP_LOSS", "深套纪律", "减仓", -1,
+                f"浮亏 {pnl_pct:.1f}% ≤ {DEEP_LOSS_PCT}% → 禁止摊薄，仅允许反弹减仓",
+            )
+        )
+        reasons.append(rule_signals[-1].reason)
+
+    # P4 gold theme
+    if _is_gold_theme(code, name, industry) and gold_theme_weight >= MAX_THEME_WEIGHT:
+        forbid_buy = True
+        rule_signals.append(
+            RuleSignal(
+                "P4_THEME", "主题集中度（黄金链）", "禁止买入", -1,
+                f"黄金相关主题合计 {gold_theme_weight:.1f}% ≥ {MAX_THEME_WEIGHT}% → 停止加仓",
+            )
+        )
+        reasons.append(rule_signals[-1].reason)
+
+    # ── 最终决策 ──
+    final: Action
+    confidence: str
+
+    if force_reduce:
+        final = "减仓"
+        confidence = "高"
+        reasons.insert(0, "持仓纪律触发强制/优先减仓")
+    elif tech_action == "卖出" and held:
+        final = "卖出"
+        confidence = "中" if abs(tech_score) == 2 else "高"
+        reasons.insert(0, "技术面卖出且当前持有")
+    elif tech_action == "卖出" and not held:
+        final = "观望"
+        confidence = "中"
+        reasons.insert(0, "技术面偏空且未持有 → 不追空、不新建")
+    elif tech_action == "买入" and forbid_buy:
+        final = "观望"
+        confidence = "中"
+        reasons.insert(0, "技术面偏多但纪律禁止买入/加仓")
+    elif tech_action == "买入" and held and weight_pct < MAX_SINGLE_WEIGHT:
+        final = "加仓"
+        confidence = "中" if tech_score == 2 else "高"
+        reasons.insert(0, "技术面买入且仓位未超限 → 允许小幅加仓")
+    elif tech_action == "买入" and not held:
+        final = "买入"
+        confidence = "中" if tech_score == 2 else "高"
+        reasons.insert(0, "技术面买入且未持有 → 允许建仓")
+    else:
+        final = "观望"
+        confidence = "低" if tech_score == 0 else "中"
+        if held:
+            reasons.insert(0, "信号不足或冲突 → 持有观望")
+        else:
+            reasons.insert(0, "信号不足 → 不操作")
+
+    rule_signals.append(
+        RuleSignal(
+            "D1_DECISION", "最终决策合成", final, _vote(final),
+            f"最终动作={final}（技术={tech_action}，净分={tech_score}，持仓={held}）",
+        )
+    )
+
+    if held and cost_price and price:
+        cost_val = cost_price * shares
+        mkt_val = price * shares
+        if pnl_pct is None and cost_val:
+            pnl_pct = (mkt_val - cost_val) / cost_val * 100
+
+    return Decision(
+        code=code,
+        name=name,
+        price=float(price) if price is not None else None,
+        action=final,
+        confidence=confidence,
+        tech_score=tech_score,
+        reasons=reasons,
+        rule_signals=[s.to_dict() for s in rule_signals],
+        context={
+            "held": held,
+            "shares": shares,
+            "cost_price": cost_price,
+            "weight_pct": weight_pct,
+            "pnl_pct": round(pnl_pct, 2) if pnl_pct is not None else None,
+            "pct_change": pct_change,
+            "tech_action": tech_action,
+            "forbid_buy": forbid_buy,
+            "force_reduce": force_reduce,
+            "disclaimer": "规则信号仅供参考，不构成投资建议",
+        },
+    )
+
+
+def evaluate_portfolio(days: int = 90) -> dict:
+    """对全部持仓跑固定策略，并汇总买卖清单。"""
+    from data.industry import get_industry
+    from data.source import get_quotes
+    from portfolio import load_positions
+
+    positions = load_positions()
+    if not positions:
+        return {
+            "message": "持仓为空",
+            "catalog": STRATEGY_CATALOG,
+            "decisions": [],
+        }
+
+    codes = [p.code for p in positions]
+    quotes = get_quotes(codes)
+    qmap = {q["code"]: q for q in quotes}
+
+    # 市值与黄金主题占比
+    items = []
+    total_mv = 0.0
+    for p in positions:
+        q = qmap.get(p.code, {})
+        price = q.get("price") or 0
+        mv = price * p.shares
+        total_mv += mv
+        name = q.get("name") or ""
+        industry = get_industry(p.code, name)
+        items.append({
+            "pos": p,
+            "q": q,
+            "price": price,
+            "mv": mv,
+            "name": name,
+            "industry": industry,
+        })
+
+    gold_mv = 0.0
+    for it in items:
+        w = (it["mv"] / total_mv * 100) if total_mv else 0
+        it["weight_pct"] = w
+        cost = it["pos"].cost_price * it["pos"].shares
+        it["pnl_pct"] = ((it["mv"] - cost) / cost * 100) if cost else None
+        # 成本为负时跳过异常收益率
+        if it["pos"].cost_price < 0:
+            it["pnl_pct"] = None
+        if _is_gold_theme(it["pos"].code, it["name"], it["industry"]):
+            gold_mv += it["mv"]
+    gold_theme_weight = (gold_mv / total_mv * 100) if total_mv else 0
+
+    decisions: list[dict] = []
+    for it in items:
+        p = it["pos"]
+        d = evaluate_code(
+            p.code,
+            held=True,
+            shares=p.shares,
+            cost_price=p.cost_price,
+            weight_pct=it["weight_pct"],
+            pnl_pct=it["pnl_pct"],
+            pct_change=it["q"].get("pct_change"),
+            name=it["name"],
+            industry=it["industry"],
+            gold_theme_weight=gold_theme_weight,
+            days=days,
+        )
+        decisions.append(d.to_dict())
+
+    # 汇总动作
+    buckets = {"买入": [], "加仓": [], "卖出": [], "减仓": [], "观望": [], "禁止买入": []}
+    for d in decisions:
+        buckets.setdefault(d["action"], []).append(d["code"])
+
+    return {
+        "total_market_value": round(total_mv, 2),
+        "gold_theme_weight": round(gold_theme_weight, 2),
+        "catalog": STRATEGY_CATALOG,
+        "summary": {k: v for k, v in buckets.items() if v},
+        "buy_or_add": [d for d in decisions if d["action"] in ("买入", "加仓")],
+        "sell_or_reduce": [d for d in decisions if d["action"] in ("卖出", "减仓")],
+        "hold_or_watch": [d for d in decisions if d["action"] in ("观望", "禁止买入")],
+        "decisions": decisions,
+        "disclaimer": "固定规则信号，不构成投资建议；请结合自身风险承受力决策。",
+    }

@@ -68,13 +68,21 @@ def mode_indicators(code: str, indicators: list[str], days: int) -> dict:
     }
 
 
+def mode_signals(code: str = "", days: int = 90) -> dict:
+    from strategy.engine import evaluate_code, evaluate_portfolio
+
+    if code:
+        return {"mode": "signals", "data": evaluate_code(code, days=days).to_dict()}
+    return {"mode": "signals", "data": evaluate_portfolio(days=days)}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="TradeMind local analysis (no LLM API)")
     parser.add_argument(
         "--mode",
-        choices=["portfolio", "quote", "kline", "indicators", "all"],
+        choices=["portfolio", "quote", "kline", "indicators", "signals", "all"],
         default="portfolio",
-        help="分析模式，默认 portfolio",
+        help="分析模式，默认 portfolio；signals=固定策略买卖决策",
     )
     parser.add_argument("--code", default="", help="股票/ETF 代码（6 位）")
     parser.add_argument("--days", type=int, default=60, help="K 线/指标回溯天数")
@@ -89,6 +97,11 @@ def main() -> int:
         if args.mode in ("portfolio", "all"):
             _dump(mode_portfolio())
             if args.mode == "portfolio":
+                return 0
+
+        if args.mode in ("signals", "all"):
+            _dump(mode_signals(args.code, days=args.days))
+            if args.mode == "signals":
                 return 0
 
         if args.mode in ("quote", "all"):
