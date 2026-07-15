@@ -6,6 +6,8 @@
 - uv run trademind portfolio list              查看持仓
 - uv run trademind portfolio add 600519 100 1500.5  添加持仓
 - uv run trademind portfolio remove 600519     删除持仓
+- uv run trademind portfolio sync-ths          从历史成交 Lscj 辅助校验/合并（非主源）
+- uv run trademind report                      生成持仓 HTML 报告并打开浏览器
 - uv run trademind signals                     持仓固定策略买卖清单
 - uv run trademind signals 518880              单票策略决策
 - uv run trademind strategies                  列出固定策略规则
@@ -89,6 +91,211 @@ def portfolio_remove(
         console.print(f"[green]✓ 已删除 {code}[/green]")
     else:
         console.print(f"[yellow]未找到 {code} 的持仓[/yellow]")
+
+
+@portfolio_app.command("sync-ths")
+def portfolio_sync_ths(
+    write: bool = typer.Option(
+        False,
+        "--write",
+        help="写入 holdings.toml（默认只预览 diff）",
+    ),
+    mode: str = typer.Option(
+        "smart",
+        "--mode",
+        help="合并策略: smart | rebuild | prefer-local | prefer-ths",
+    ),
+    update_cost: bool = typer.Option(
+        False,
+        "--update-cost",
+        help="股数一致时也用成交加权成本覆盖本地成本",
+    ),
+    prune_missing: bool = typer.Option(
+        False,
+        "--prune",
+        help="rebuild/prefer-ths 时删除源中无记录的本地持仓",
+    ),
+    lscj_dir: str | None = typer.Option(
+        None,
+        "--lscj-dir",
+        help="自定义 XcsLscjDataFile 目录（默认 Mac 同花顺 sandbox）",
+    ),
+    probe: bool = typer.Option(
+        False,
+        "--probe",
+        help="只探测本地有哪些数据源（不重建持仓）",
+    ),
+):
+    """用同花顺本地「历史成交」做辅助校验/合并（非主源）。
+
+    主持仓请维护 holdings.toml（截图/手动）。
+    已放弃 Frida/进程注入抓包（风险高、需关闭系统防护，ROI 低）。
+    """
+    from data.ths_local import probe_local_sources, sync_summary
+    from portfolio import save_positions
+
+    if probe:
+        info = probe_local_sources()
+        console.print(
+            Panel(
+                f"{info['conclusion']}\n\n目录: {info['docs_dir']}\n存在: {info['docs_exists']}",
+                title="同花顺本地探测结论",
+                border_style="yellow",
+            )
+        )
+        table = Table(title="候选数据源", show_lines=True)
+        table.add_column("名称")
+        table.add_column("可否作持仓源")
+        table.add_column("说明")
+        table.add_column("文件数", justify="right")
+        for c in info["candidates"]:
+            usable = c["usable_for_holdings"]
+            if usable is True:
+                u = "[green]是[/green]"
+            elif usable == "partial":
+                u = "[yellow]部分[/yellow]"
+            else:
+                u = "[red]否[/red]"
+            table.add_row(c["name"], u, c["detail"], str(len(c.get("files") or [])))
+        console.print(table)
+        console.print(
+            "[dim]主持仓请用 holdings.toml；Lscj 仅辅助。已放弃进程注入抓包。[/dim]"
+        )
+        return
+
+    mode = (mode or "smart").strip().lower()
+    if mode not in ("smart", "rebuild", "prefer-local", "prefer-ths"):
+        console.print(f"[red]未知 mode={mode}[/red]")
+        raise typer.Exit(1)
+
+    summary = sync_summary(
+        lscj_dir=lscj_dir,
+        mode=mode,  # type: ignore[arg-type]
+        update_cost=update_cost,
+        prune_missing=prune_missing,
+    )
+    if not summary["files"]:
+        console.print(
+            "[red]未找到历史成交 XcsLscjDataFile_*[/red]\n"
+            f"[dim]查找目录: {summary['lscj_dir']}[/dim]\n"
+            "持仓请直接维护 [cyan]holdings.toml[/cyan] "
+            "（portfolio add / 编辑文件）。"
+        )
+        raise typer.Exit(1)
+
+    console.print(
+        Panel(
+            f"来源: 历史成交 Lscj（辅助，窗口外底仓可能不全）\n"
+            f"目录: {summary['lscj_dir']}\n"
+            f"文件: {', '.join(summary['files'])}\n"
+            f"账号: {', '.join(summary['accounts']) or '—'}\n"
+            f"成交: {summary['fill_count']} 笔  "
+            f"区间 {summary['date_min']} → {summary['date_max']}\n"
+            f"合并: mode={mode}"
+            + ("  update-cost" if update_cost else "")
+            + ("  prune" if prune_missing else "")
+            + "\n主源: holdings.toml（截图/手动）",
+            title="同花顺本地历史成交",
+            border_style="cyan",
+        )
+    )
+
+    table = Table(title="同步预览（相对当前 holdings.toml）", show_lines=False)
+    table.add_column("代码", style="cyan")
+    table.add_column("动作")
+    table.add_column("本地股数", justify="right")
+    table.add_column("源股数", justify="right")
+    table.add_column("最终股数", justify="right")
+    table.add_column("本地成本", justify="right")
+    table.add_column("最终成本", justify="right")
+    table.add_column("说明")
+
+    changed = 0
+    for r in summary["rows"]:
+        if r.action != "keep":
+            changed += 1
+        style = {
+            "add": "green",
+            "update": "yellow",
+            "prefer_local": "magenta",
+            "prefer_ths": "yellow",
+            "remove": "red",
+            "keep": "dim",
+        }.get(r.action, "")
+        table.add_row(
+            r.code,
+            f"[{style}]{r.action}[/{style}]" if style else r.action,
+            str(r.local_shares) if r.local_shares else "—",
+            str(r.ths_shares) if r.ths_shares else "—",
+            str(r.final_shares) if r.final_shares else "—",
+            f"{r.local_cost:.3f}" if r.local_shares else "—",
+            f"{r.final_cost:.3f}" if r.final_shares else "—",
+            r.note,
+        )
+    console.print(table)
+
+    incomplete = [
+        p.code for p in summary["ths_positions"].values() if p.history_incomplete
+    ]
+    if incomplete:
+        console.print(
+            f"[yellow]提示：Lscj 流水首笔为卖，底仓可能不全：{', '.join(incomplete)}[/yellow]"
+        )
+
+    positions = summary["positions"]
+    if not write:
+        console.print(
+            f"\n[dim]预览完成（{len(positions)} 只最终持仓，{changed} 项动作非 keep）。"
+            f"确认后加 [cyan]--write[/cyan] 写入 holdings.toml[/dim]"
+        )
+        return
+
+    save_positions(positions)
+    console.print(
+        f"[green]✓ 已写入 holdings.toml，共 {len(positions)} 只持仓[/green]"
+    )
+
+
+# ──────────────────────────── HTML 报告 ────────────────────────────
+
+
+@app.command("report")
+def report_cmd(
+    output: str | None = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="输出 HTML 路径（默认 notes/reports/portfolio_时间戳.html）",
+    ),
+    no_signals: bool = typer.Option(
+        False,
+        "--no-signals",
+        help="不跑固定策略（更快，仅行情/盈亏/风险）",
+    ),
+    no_open: bool = typer.Option(
+        False,
+        "--no-open",
+        help="不自动打开浏览器",
+    ),
+    days: int = typer.Option(90, "--days", help="策略技术回溯天数"),
+):
+    """生成持仓分析 HTML 报告（单文件，可本地打开分享）。"""
+    from report.html_report import write_portfolio_report
+
+    console.print("[dim]正在拉取持仓/行情" + (" + 策略信号…" if not no_signals else "…") + "[/dim]")
+    try:
+        path = write_portfolio_report(
+            output,
+            include_signals=not no_signals,
+            days=days,
+            open_browser=not no_open,
+        )
+    except Exception as e:
+        console.print(f"[red]报告生成失败: {e}[/red]")
+        raise typer.Exit(1) from e
+    console.print(f"[green]✓ HTML 报告已生成[/green]\n  {path}")
+    if not no_open:
+        console.print("[dim]已尝试在默认浏览器中打开。[/dim]")
 
 
 # ──────────────────────────── 固定策略 ────────────────────────────

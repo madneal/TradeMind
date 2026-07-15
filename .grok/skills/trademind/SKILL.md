@@ -34,6 +34,18 @@ cd /Users/neal/project/TradeMind && uv run python .grok/skills/trademind/scripts
 
 得到 JSON：`overview` / `pnl` / `risk`。
 
+### 1c. HTML 报告（可浏览器打开）
+
+```bash
+cd /Users/neal/project/TradeMind && uv run trademind report
+# 仅行情盈亏（更快）:
+uv run trademind report --no-signals
+# 指定路径:
+uv run trademind report -o /tmp/holdings.html
+```
+
+默认写入 `notes/reports/portfolio_时间戳.html` 并尝试打开浏览器。
+
 ### 1b. 固定策略买卖清单（决策必跑）
 
 用户问买卖/调仓时优先：
@@ -77,6 +89,9 @@ cd /Users/neal/project/TradeMind && uv run python .grok/skills/trademind/scripts
 uv run trademind portfolio list
 uv run trademind portfolio add <code> <shares> <cost>
 uv run trademind portfolio remove <code>
+# 主源 = holdings.toml（截图/手动）。可选 Lscj 辅助校验：
+uv run trademind portfolio sync-ths
+uv run trademind portfolio sync-ths --probe
 ```
 
 也可直接编辑 `holdings.toml`。
