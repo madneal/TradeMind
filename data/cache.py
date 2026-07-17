@@ -18,6 +18,24 @@ QUOTE_TTL = 60
 KLINE_TTL = 86400
 
 
+def invalidate_quote_cache(codes: list[str] | None = None) -> int:
+    """删除行情缓存。codes=None 时清空全部。返回删除行数。"""
+    conn = _get_conn()
+    try:
+        if codes:
+            n = 0
+            for c in codes:
+                cur = conn.execute("DELETE FROM quote_cache WHERE code=?", (c,))
+                n += cur.rowcount
+            conn.commit()
+            return n
+        cur = conn.execute("DELETE FROM quote_cache")
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
 def _get_conn() -> sqlite3.Connection:
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)

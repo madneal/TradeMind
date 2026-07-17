@@ -222,34 +222,42 @@ def evaluate_code(
     industry: str = "",
     gold_theme_weight: float = 0.0,
     days: int = 90,
+    quote: dict[str, Any] | None = None,
+    kline_df: pd.DataFrame | None = None,
 ) -> Decision:
-    """对单只代码做固定策略评估。"""
+    """对单只代码做固定策略评估。
+
+    quote / kline_df 可预先传入，避免组合评估时重复网络请求。
+    """
     from data.source import get_kline, get_quote, normalize_code
 
     code = normalize_code(code)
-    quote: dict[str, Any] = {}
-    try:
-        quote = get_quote(code)
-    except Exception:
-        quote = {}
-    name = name or quote.get("name") or ""
-    price = quote.get("price")
-    if pct_change is None:
+    if quote is None:
+        try:
+            quote = get_quote(code)
+        except Exception:
+            quote = {}
+    name = name or (quote.get("name") if quote else "") or ""
+    price = quote.get("price") if quote else None
+    if pct_change is None and quote:
         pct_change = quote.get("pct_change")
 
-    try:
-        df = get_kline(code, period="daily", days=days)
-    except Exception as e:
-        return Decision(
-            code=code,
-            name=name,
-            price=price,
-            action="观望",
-            confidence="低",
-            tech_score=0,
-            reasons=[f"无法获取 K 线：{e}"],
-            context={"error": str(e)},
-        )
+    if kline_df is not None:
+        df = kline_df
+    else:
+        try:
+            df = get_kline(code, period="daily", days=days)
+        except Exception as e:
+            return Decision(
+                code=code,
+                name=name,
+                price=price,
+                action="观望",
+                confidence="低",
+                tech_score=0,
+                reasons=[f"无法获取 K 线：{e}"],
+                context={"error": str(e)},
+            )
 
     if df is None or df.empty:
         return Decision(
@@ -549,13 +557,27 @@ def evaluate_code(
     )
 
 
-def evaluate_portfolio(days: int = 90) -> dict:
-    """对全部持仓跑固定策略，并汇总买卖清单。"""
+def evaluate_portfolio(
+    days: int = 90,
+    *,
+    quotes: list[dict] | None = None,
+    positions: list | None = None,
+    max_workers: int = 8,
+) -> dict:
+    """对全部持仓跑固定策略，并汇总买卖清单。
+
+    性能优化：
+    - 可复用外部已拉好的 positions / quotes（报告生成路径只请求 1 次行情）
+    - 单票 K 线 + 财报评估用线程池并行（默认 8 路），避免串行 N 次网络 RTT
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     from data.industry import get_industry
-    from data.source import get_quotes
+    from data.source import get_kline, get_quotes
     from portfolio import load_positions
 
-    positions = load_positions()
+    if positions is None:
+        positions = load_positions()
     if not positions:
         return {
             "message": "持仓为空",
@@ -564,7 +586,8 @@ def evaluate_portfolio(days: int = 90) -> dict:
         }
 
     codes = [p.code for p in positions]
-    quotes = get_quotes(codes)
+    if quotes is None:
+        quotes = get_quotes(codes)
     qmap = {q["code"]: q for q in quotes}
 
     # 市值与黄金主题占比
@@ -592,16 +615,20 @@ def evaluate_portfolio(days: int = 90) -> dict:
         it["weight_pct"] = w
         cost = it["pos"].cost_price * it["pos"].shares
         it["pnl_pct"] = ((it["mv"] - cost) / cost * 100) if cost else None
-        # 成本为负时跳过异常收益率
         if it["pos"].cost_price < 0:
             it["pnl_pct"] = None
         if _is_gold_theme(it["pos"].code, it["name"], it["industry"]):
             gold_mv += it["mv"]
     gold_theme_weight = (gold_mv / total_mv * 100) if total_mv else 0
 
-    decisions: list[dict] = []
-    for it in items:
+    def _eval_one(it: dict) -> dict:
         p = it["pos"]
+        # 每线程独立拉 K 线；财报在 evaluate_fundamentals 内有 SQLite 缓存
+        kdf = None
+        try:
+            kdf = get_kline(p.code, period="daily", days=days)
+        except Exception:
+            kdf = None
         d = evaluate_code(
             p.code,
             held=True,
@@ -614,10 +641,37 @@ def evaluate_portfolio(days: int = 90) -> dict:
             industry=it["industry"],
             gold_theme_weight=gold_theme_weight,
             days=days,
+            quote=it["q"],
+            kline_df=kdf,
         )
-        decisions.append(d.to_dict())
+        return d.to_dict()
 
-    # 汇总动作
+    workers = max(1, min(max_workers, len(items)))
+    decisions: list[dict] = []
+    if workers == 1 or len(items) == 1:
+        decisions = [_eval_one(it) for it in items]
+    else:
+        # 保持与持仓顺序一致
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(_eval_one, it): i for i, it in enumerate(items)}
+            ordered: list[dict | None] = [None] * len(items)
+            for fut in as_completed(futs):
+                idx = futs[fut]
+                try:
+                    ordered[idx] = fut.result()
+                except Exception as e:
+                    p = items[idx]["pos"]
+                    ordered[idx] = Decision(
+                        code=p.code,
+                        name=items[idx]["name"],
+                        price=items[idx]["price"],
+                        action="观望",
+                        confidence="低",
+                        tech_score=0,
+                        reasons=[f"评估异常：{e}"],
+                    ).to_dict()
+            decisions = [d for d in ordered if d is not None]
+
     buckets = {"买入": [], "加仓": [], "卖出": [], "减仓": [], "观望": [], "禁止买入": []}
     for d in decisions:
         buckets.setdefault(d["action"], []).append(d["code"])

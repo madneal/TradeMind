@@ -21,16 +21,8 @@ def _load_and_quote() -> tuple[list, list]:
     return positions, quotes
 
 
-@register(
-    name="get_portfolio",
-    description="获取用户持仓概览：每只持仓的实时价格、涨跌幅、市值、占组合比例。当用户问'我的持仓怎么样''持仓概览''持仓情况'时使用。",
-    parameters={
-        "type": "object",
-        "properties": {},
-    },
-)
-def get_portfolio() -> dict:
-    positions, quotes = _load_and_quote()
+def portfolio_overview_from(positions: list, quotes: list) -> dict:
+    """用已有 positions + quotes 组装持仓概览（不再请求网络）。"""
     if not positions:
         return {"message": "持仓为空，请先用 add 命令添加持仓（uv run trademind portfolio add 600519 100 1500）"}
 
@@ -42,6 +34,21 @@ def get_portfolio() -> dict:
         price = q.get("price") or 0
         market_value = price * p.shares
         total_market_value += market_value
+        # 今日盈亏金额 = 涨跌额 × 股数
+        change = q.get("change")
+        if change is None:
+            prev = q.get("prev_close")
+            if prev is not None and price:
+                try:
+                    change = float(price) - float(prev)
+                except (TypeError, ValueError):
+                    change = None
+        day_pnl = None
+        if change is not None:
+            try:
+                day_pnl = round(float(change) * p.shares, 2)
+            except (TypeError, ValueError):
+                day_pnl = None
         items.append({
             "code": p.code,
             "name": q.get("name", ""),
@@ -49,12 +56,15 @@ def get_portfolio() -> dict:
             "cost_price": p.cost_price,
             "price": price,
             "pct_change": q.get("pct_change"),
+            "change": change,
+            "day_pnl": day_pnl,
             "market_value": round(market_value, 2),
         })
 
-    # 计算占比
     for item in items:
-        item["weight_pct"] = round(item["market_value"] / total_market_value * 100, 2) if total_market_value else 0
+        item["weight_pct"] = (
+            round(item["market_value"] / total_market_value * 100, 2) if total_market_value else 0
+        )
 
     return {
         "total_market_value": round(total_market_value, 2),
@@ -63,16 +73,8 @@ def get_portfolio() -> dict:
     }
 
 
-@register(
-    name="analyze_pnl",
-    description="分析用户持仓的盈亏情况：每只持仓的浮盈浮亏金额、收益率，以及组合总投入、总市值、总盈亏。当用户问'我赚了多少''盈亏分析''持仓收益'时使用。",
-    parameters={
-        "type": "object",
-        "properties": {},
-    },
-)
-def analyze_pnl() -> dict:
-    positions, quotes = _load_and_quote()
+def portfolio_pnl_from(positions: list, quotes: list) -> dict:
+    """用已有 positions + quotes 组装盈亏（不再请求网络）。"""
     if not positions:
         return {"message": "持仓为空"}
 
@@ -103,8 +105,6 @@ def analyze_pnl() -> dict:
 
     total_pnl = total_market - total_cost
     total_pnl_pct = round(total_pnl / total_cost * 100, 2) if total_cost else 0
-
-    # 按收益率排序
     items.sort(key=lambda x: x["pnl_pct"], reverse=True)
 
     return {
@@ -116,25 +116,15 @@ def analyze_pnl() -> dict:
     }
 
 
-@register(
-    name="analyze_portfolio_risk",
-    description="分析用户持仓组合的风险特征：行业分布、集中度（HHI 指数）、持仓数量、是否有单只占比过高的情况。当用户问'持仓风险''行业分布''是不是太集中'时使用。",
-    parameters={
-        "type": "object",
-        "properties": {},
-    },
-)
-def analyze_portfolio_risk() -> dict:
+def portfolio_risk_from(positions: list, quotes: list) -> dict:
+    """用已有 positions + quotes 组装风险（不再请求网络）。"""
     from data.industry import get_industry
 
-    positions, quotes = _load_and_quote()
     if not positions:
         return {"message": "持仓为空"}
 
     quote_map = {q["code"]: q for q in quotes}
     total_market_value = 0.0
-
-    # 按行业归集市值
     industry_value: dict[str, float] = {}
     item_details = []
     for p in positions:
@@ -149,24 +139,26 @@ def analyze_portfolio_risk() -> dict:
             "name": q.get("name", ""),
             "industry": industry,
             "market_value": round(market_value, 2),
-            "weight_pct": 0,  # 稍后填充
+            "weight_pct": 0,
         })
 
-    # 计算行业占比
     industry_items = []
     for ind, val in sorted(industry_value.items(), key=lambda x: x[1], reverse=True):
         pct = round(val / total_market_value * 100, 2) if total_market_value else 0
         industry_items.append({"industry": ind, "market_value": round(val, 2), "weight_pct": pct})
 
-    # HHI 指数（0~10000，越高越集中）
-    hhi = sum((v / total_market_value) ** 2 for v in industry_value.values()) * 10000 if total_market_value else 0
+    hhi = (
+        sum((v / total_market_value) ** 2 for v in industry_value.values()) * 10000
+        if total_market_value
+        else 0
+    )
     hhi = round(hhi, 0)
 
-    # 单只持仓占比
     for item in item_details:
-        item["weight_pct"] = round(item["market_value"] / total_market_value * 100, 2) if total_market_value else 0
+        item["weight_pct"] = (
+            round(item["market_value"] / total_market_value * 100, 2) if total_market_value else 0
+        )
 
-    # 风险提示
     warnings = []
     single_max = max((item["weight_pct"] for item in item_details), default=0)
     if single_max > 40:
@@ -188,3 +180,42 @@ def analyze_portfolio_risk() -> dict:
         "warnings": warnings if warnings else ["组合分散度良好"],
         "positions": item_details,
     }
+
+
+@register(
+    name="get_portfolio",
+    description="获取用户持仓概览：每只持仓的实时价格、涨跌幅、市值、占组合比例。当用户问'我的持仓怎么样''持仓概览''持仓情况'时使用。",
+    parameters={
+        "type": "object",
+        "properties": {},
+    },
+)
+def get_portfolio() -> dict:
+    positions, quotes = _load_and_quote()
+    return portfolio_overview_from(positions, quotes)
+
+
+@register(
+    name="analyze_pnl",
+    description="分析用户持仓的盈亏情况：每只持仓的浮盈浮亏金额、收益率，以及组合总投入、总市值、总盈亏。当用户问'我赚了多少''盈亏分析''持仓收益'时使用。",
+    parameters={
+        "type": "object",
+        "properties": {},
+    },
+)
+def analyze_pnl() -> dict:
+    positions, quotes = _load_and_quote()
+    return portfolio_pnl_from(positions, quotes)
+
+
+@register(
+    name="analyze_portfolio_risk",
+    description="分析用户持仓组合的风险特征：行业分布、集中度（HHI 指数）、持仓数量、是否有单只占比过高的情况。当用户问'持仓风险''行业分布''是不是太集中'时使用。",
+    parameters={
+        "type": "object",
+        "properties": {},
+    },
+)
+def analyze_portfolio_risk() -> dict:
+    positions, quotes = _load_and_quote()
+    return portfolio_risk_from(positions, quotes)

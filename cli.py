@@ -8,6 +8,7 @@
 - uv run trademind portfolio remove 600519     删除持仓
 - uv run trademind portfolio sync-ths          从历史成交 Lscj 辅助校验/合并（非主源）
 - uv run trademind report                      生成持仓 HTML 报告并打开浏览器
+- uv run trademind serve                       本地 HTTP 服务托管持仓报告
 - uv run trademind signals                     持仓固定策略买卖清单
 - uv run trademind signals 518880              单票策略决策
 - uv run trademind strategies                  列出固定策略规则
@@ -296,6 +297,52 @@ def report_cmd(
     console.print(f"[green]✓ HTML 报告已生成[/green]\n  {path}")
     if not no_open:
         console.print("[dim]已尝试在默认浏览器中打开。[/dim]")
+
+
+@app.command("serve")
+def serve_cmd(
+    host: str = typer.Option("127.0.0.1", "--host", help="绑定地址（默认仅本机）"),
+    port: int = typer.Option(8765, "--port", "-p", help="端口"),
+    no_signals: bool = typer.Option(
+        False,
+        "--no-signals",
+        help="生成时不跑固定策略（更快）",
+    ),
+    days: int = typer.Option(90, "--days", help="策略技术回溯天数"),
+    no_open: bool = typer.Option(False, "--no-open", help="不自动打开浏览器"),
+    no_generate: bool = typer.Option(
+        False,
+        "--no-generate",
+        help="启动时不重新生成，仅托管已有 HTML",
+    ),
+):
+    """启动本地 HTTP 服务，在浏览器中查看/刷新持仓 HTML 报告。
+
+    默认地址: http://127.0.0.1:8765/
+    - /         最新报告
+    - /refresh  重新生成
+    - /history  历史时间戳报告列表
+    """
+    from report.server import run_server
+
+    console.print(
+        f"[cyan]TradeMind 报告服务[/cyan]  →  [bold]http://{host}:{port}/[/bold]\n"
+        f"[dim]signals={'off' if no_signals else 'on'}  days={days}  "
+        f"generate_on_start={not no_generate}[/dim]"
+    )
+    try:
+        run_server(
+            host=host,
+            port=port,
+            include_signals=not no_signals,
+            days=days,
+            open_browser=not no_open,
+            generate_on_start=not no_generate,
+        )
+    except OSError as e:
+        console.print(f"[red]启动失败: {e}[/red]")
+        console.print("[dim]端口占用时可换: uv run trademind serve -p 8766[/dim]")
+        raise typer.Exit(1) from e
 
 
 # ──────────────────────────── 固定策略 ────────────────────────────
