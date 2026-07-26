@@ -20,10 +20,11 @@ from strategy.rules import (
     RSI_OVERBOUGHT,
     RSI_OVERSOLD,
     ST_DAY_DROP,
-    ST_MAX_WEIGHT,
     STRATEGY_CATALOG,
     TECH_BUY_SCORE,
     TECH_SELL_SCORE,
+    THEME_RISK_NAME_KEYWORDS,
+    THEME_SINGLE_COST_MAX_PCT,
 )
 
 Action = Literal["买入", "卖出", "观望", "减仓", "加仓", "禁止买入"]
@@ -77,6 +78,14 @@ def _is_gold_theme(code: str, name: str, industry: str = "") -> bool:
         return True
     text = f"{name}{industry}"
     return any(k in text for k in GOLD_THEME_NAME_KEYWORDS)
+
+
+def _is_theme_risk_position(code: str, name: str, industry: str = "") -> bool:
+    """主题/高波动标的：适用 A2 单票成本预算。"""
+    if _is_gold_theme(code, name, industry):
+        return True
+    text = f"{name}{industry}"
+    return any(k in text for k in THEME_RISK_NAME_KEYWORDS)
 
 
 def _ma_signal(close: pd.Series) -> RuleSignal:
@@ -183,13 +192,33 @@ def _boll_signal(close: pd.Series) -> RuleSignal:
 
 
 def _technical_bundle(df: pd.DataFrame) -> tuple[list[RuleSignal], int, Action]:
+    """S1~S4 打分；空头排列时作废 RSI/布林「买入」分（禁下跌抄底）。"""
     close = df["close"]
-    signals = [
-        _ma_signal(close),
-        _macd_signal(close),
-        _rsi_signal(close),
-        _boll_signal(close),
-    ]
+    s1 = _ma_signal(close)
+    s2 = _macd_signal(close)
+    s3 = _rsi_signal(close)
+    s4 = _boll_signal(close)
+
+    # B5 → 引擎：S1 空头时，超卖/下轨不得贡献买入分
+    if s1.action == "卖出":
+        if s3.action == "买入":
+            s3 = RuleSignal(
+                "S3_RSI",
+                "RSI 超买超卖",
+                "观望",
+                0,
+                f"{s3.reason}；空头排列下超卖不作为买点（B5）",
+            )
+        if s4.action == "买入":
+            s4 = RuleSignal(
+                "S4_BOLL",
+                "布林带位置",
+                "观望",
+                0,
+                f"{s4.reason}；空头排列下贴下轨不作为买点（B5）",
+            )
+
+    signals = [s1, s2, s3, s4]
     score = sum(s.score for s in signals)
     if score >= TECH_BUY_SCORE:
         action: Action = "买入"
@@ -197,13 +226,20 @@ def _technical_bundle(df: pd.DataFrame) -> tuple[list[RuleSignal], int, Action]:
         action = "卖出"
     else:
         action = "观望"
+    note = (
+        f"S1~S4 净分={score}（买入阈值≥{TECH_BUY_SCORE}，卖出阈值≤{TECH_SELL_SCORE}）→ {action}"
+    )
+    if s1.action == "卖出" and any(
+        "空头排列下" in (s.reason or "") for s in (s3, s4)
+    ):
+        note += "；已屏蔽空头下均值回归买入分"
     signals.append(
         RuleSignal(
             "S5_COMPOSITE",
             "技术面合成",
             action,
             _vote(action),
-            f"S1~S4 净分={score}（买入阈值≥{TECH_BUY_SCORE}，卖出阈值≤{TECH_SELL_SCORE}）→ {action}",
+            note,
         )
     )
     return signals, score, action
@@ -221,6 +257,7 @@ def evaluate_code(
     name: str = "",
     industry: str = "",
     gold_theme_weight: float = 0.0,
+    total_assets: float | None = None,
     days: int = 90,
     quote: dict[str, Any] | None = None,
     kline_df: pd.DataFrame | None = None,
@@ -228,6 +265,7 @@ def evaluate_code(
     """对单只代码做固定策略评估。
 
     quote / kline_df 可预先传入，避免组合评估时重复网络请求。
+    total_assets：总资产（市值+现金），用于主题单票成本预算（P6/A2）。
     """
     from data.source import get_kline, get_quote, normalize_code
 
@@ -321,12 +359,9 @@ def evaluate_code(
     forbid_buy = bool(fund.forbid_buy)
     is_st = _is_st(name, code) or "ST" in (name or "")
 
-    # P2 ST
+    # P2 ST：禁止新建/加仓；不设仓位%硬上限；单日暴跌可纪律减仓
     if is_st or "ST" in (name or ""):
         st_reasons = []
-        if held and weight_pct > ST_MAX_WEIGHT:
-            force_reduce = True
-            st_reasons.append(f"ST 仓位 {weight_pct:.1f}% > {ST_MAX_WEIGHT}%")
         if pct_change is not None and pct_change <= ST_DAY_DROP:
             force_reduce = True
             st_reasons.append(f"ST 单日跌幅 {pct_change}% ≤ {ST_DAY_DROP}%")
@@ -335,7 +370,7 @@ def evaluate_code(
         rule_signals.append(
             RuleSignal(
                 "P2_ST", "ST 纪律", action_st, -1 if force_reduce else 0,
-                "；".join(st_reasons) if st_reasons else "ST/高风险标的：禁止加仓",
+                "；".join(st_reasons) if st_reasons else "ST/高风险标的：禁止加仓（存量不设仓位%上限）",
             )
         )
         reasons.append(rule_signals[-1].reason)
@@ -388,6 +423,61 @@ def evaluate_code(
             )
         )
         reasons.append(rule_signals[-1].reason)
+
+    # P6 主题单票成本预算（A2）：成本金额/总资产 > 5% → 禁止加仓
+    theme_cost_pct: float | None = None
+    if (
+        total_assets is not None
+        and total_assets > 0
+        and held
+        and cost_price
+        and cost_price > 0
+        and shares > 0
+        and _is_theme_risk_position(code, name, industry)
+    ):
+        cost_amt = float(cost_price) * int(shares)
+        theme_cost_pct = cost_amt / float(total_assets) * 100
+        if theme_cost_pct > THEME_SINGLE_COST_MAX_PCT:
+            forbid_buy = True
+            rule_signals.append(
+                RuleSignal(
+                    "P6_THEME_COST",
+                    "主题单票成本预算（A2）",
+                    "禁止买入",
+                    -1,
+                    (
+                        f"主题/高波动标的成本 {cost_amt:,.0f} 元 = 总资产 "
+                        f"{theme_cost_pct:.1f}% > {THEME_SINGLE_COST_MAX_PCT:.0f}% → 禁止加仓"
+                    ),
+                )
+            )
+            reasons.append(rule_signals[-1].reason)
+        else:
+            rule_signals.append(
+                RuleSignal(
+                    "P6_THEME_COST",
+                    "主题单票成本预算（A2）",
+                    "观望",
+                    0,
+                    (
+                        f"主题成本占比 {theme_cost_pct:.1f}%"
+                        f"（上限 {THEME_SINGLE_COST_MAX_PCT:.0f}%）"
+                    ),
+                )
+            )
+    elif _is_theme_risk_position(code, name, industry) and not held:
+        rule_signals.append(
+            RuleSignal(
+                "P6_THEME_COST",
+                "主题单票成本预算（A2）",
+                "观望",
+                0,
+                (
+                    f"新建主题仓：下单成本金额应 ≤ 总资产 "
+                    f"{THEME_SINGLE_COST_MAX_PCT:.0f}%（请按 stop-loss R 缩放）"
+                ),
+            )
+        )
 
     if held and cost_price and price:
         cost_val = cost_price * shares
@@ -547,6 +637,8 @@ def evaluate_code(
             "force_reduce": force_reduce,
             "fund_level": fund_level,
             "fundamentals": fund.to_dict(),
+            "theme_cost_pct": round(theme_cost_pct, 2) if theme_cost_pct is not None else None,
+            "total_assets": total_assets,
             "disclaimer": "规则信号与执行计划仅供参考，不构成投资建议",
         },
     )
@@ -569,7 +661,7 @@ def evaluate_portfolio(
 
     from data.industry import get_industry
     from data.source import get_kline, get_quotes
-    from portfolio import load_positions
+    from portfolio import load_cash, load_positions
 
     if positions is None:
         positions = load_positions()
@@ -616,6 +708,10 @@ def evaluate_portfolio(
             gold_mv += it["mv"]
     gold_theme_weight = (gold_mv / total_mv * 100) if total_mv else 0
 
+    cash = load_cash()
+    cash_f = float(cash) if cash is not None else 0.0
+    total_assets = total_mv + cash_f if total_mv else cash_f
+
     def _eval_one(it: dict) -> dict:
         p = it["pos"]
         # 每线程独立拉 K 线；财报在 evaluate_fundamentals 内有 SQLite 缓存
@@ -635,6 +731,7 @@ def evaluate_portfolio(
             name=it["name"],
             industry=it["industry"],
             gold_theme_weight=gold_theme_weight,
+            total_assets=total_assets if total_assets > 0 else None,
             days=days,
             quote=it["q"],
             kline_df=kdf,
@@ -673,6 +770,8 @@ def evaluate_portfolio(
 
     return {
         "total_market_value": round(total_mv, 2),
+        "cash": round(cash_f, 2) if cash is not None else None,
+        "total_assets": round(total_assets, 2) if total_assets else None,
         "gold_theme_weight": round(gold_theme_weight, 2),
         "catalog": STRATEGY_CATALOG,
         "summary": {k: v for k, v in buckets.items() if v},

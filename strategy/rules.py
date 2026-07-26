@@ -17,9 +17,17 @@ MAX_SINGLE_WEIGHT = 30.0     # 单票市值占比超过 → 建议减仓
 HARD_SINGLE_WEIGHT = 40.0    # 单票超过 → 强烈减仓
 MAX_THEME_WEIGHT = 45.0      # 黄金链等主题合计超过 → 禁止加仓
 DEEP_LOSS_PCT = -40.0        # 浮亏超过 → 反弹减仓优先，禁止摊薄
-ST_MAX_WEIGHT = 5.0          # ST 仓位超过 → 减仓
+# ST 不设仓位硬上限（曾用 5%，已移除）：仍禁止新建/加仓；单日暴跌可纪律减仓
 ST_DAY_DROP = -8.0           # ST 单日跌幅超过 → 纪律减仓
 MIN_CASH_HINT = 5.0          # 建议保留现金比例（结构提示）
+
+# ── 主题单票风险预算（知识库 A2 → 引擎硬拦）──
+# 主题/高波动标的：持仓成本金额 / 总资产 > 此值 → 禁止加仓（不强制清仓）
+THEME_SINGLE_COST_MAX_PCT = 5.0
+THEME_RISK_NAME_KEYWORDS = (
+    "黄金", "白银", "有色", "汽车", "卫星", "芯片", "电池",
+    "稀土", "光伏", "锂", "新能源", "智能驾驶", "存储",
+)
 
 # ── 止损纪律（用户原则，2026-07-26 起）──
 # 旧：NO_LOSS_EXIT=True → 浮亏禁止主动卖，仅基本面破坏破例。
@@ -80,7 +88,10 @@ STRATEGY_CATALOG = [
     {
         "id": "S5_COMPOSITE",
         "name": "技术面合成",
-        "buy": f"S1~S4 净分 ≥ {TECH_BUY_SCORE} → 技术面「买入」",
+        "buy": (
+            f"S1~S4 净分 ≥ {TECH_BUY_SCORE} → 技术面「买入」；"
+            "空头排列时 RSI 超卖/布林下轨不计入买入分（禁抄底）"
+        ),
         "sell": f"S1~S4 净分 ≤ {TECH_SELL_SCORE} → 技术面「卖出」",
         "hold": "其余 → 技术面「观望」",
     },
@@ -88,7 +99,7 @@ STRATEGY_CATALOG = [
         "id": "F0_COMPLIANCE",
         "name": "合规与警示（一票否决）",
         "buy": "非 ST/*ST/退市整理 且无强制否决标签 → 允许进入后续规则",
-        "sell": "ST/*ST 仓位超限或单日暴跌 → 优先减仓；名称含退市风险 → 禁止买入",
+        "sell": "ST/*ST 单日暴跌 → 优先减仓；名称含退市风险 → 禁止买入",
         "hold": "ETF/指数基金跳过本层",
     },
     {
@@ -109,8 +120,8 @@ STRATEGY_CATALOG = [
         "id": "P2_ST",
         "name": "ST 纪律",
         "buy": "禁止新建/加仓 ST",
-        "sell": f"ST 仓位 > {ST_MAX_WEIGHT:.0f}% 或 单日跌幅 < {ST_DAY_DROP:.0f}% → 减仓/清仓优先",
-        "hold": "无 ST 或仓位极小",
+        "sell": f"ST 单日跌幅 ≤ {ST_DAY_DROP:.0f}% → 纪律减仓优先（不设仓位%硬上限）",
+        "hold": "ST 可持有存量，但不加仓",
     },
     {
         "id": "P3_DEEP_LOSS",
@@ -125,6 +136,16 @@ STRATEGY_CATALOG = [
         "buy": f"黄金相关主题合计 < {MAX_THEME_WEIGHT:.0f}% 时才允许加黄金方向",
         "sell": f"黄金相关主题合计 ≥ {MAX_THEME_WEIGHT:.0f}% → 停止加仓，反弹优先减波动更大的黄金股",
         "hold": "主题占比可控",
+    },
+    {
+        "id": "P6_THEME_COST",
+        "name": "主题单票成本预算（A2）",
+        "buy": (
+            f"主题/高波动标的：持仓成本金额 ≤ 总资产 {THEME_SINGLE_COST_MAX_PCT:.0f}% 才允许加仓；"
+            "超限 → 禁止加仓（新建仓亦应按此缩放）"
+        ),
+        "sell": "超限不强制卖出，但禁止继续加仓；建议反弹降到预算内",
+        "hold": f"非主题标的不套用本条；阈值 {THEME_SINGLE_COST_MAX_PCT:.0f}% 对齐知识库 A2",
     },
     {
         "id": "P5_STOP_LOSS",

@@ -5,7 +5,8 @@ description: >
   no XAI_API_KEY required. Use Grok Build as the LLM: run portfolio/quote/kline/
   indicator/signals scripts, then interpret in Chinese. When the user asks whether
   to BUY a new stock or asks for BUY/SELL TIMING, ALWAYS auto-load the personal
-  knowledge base (avoid-checklist + failures + decision-template) before concluding.
+  knowledge base (avoid-checklist + failures + decision-template + strong-stock)
+  before concluding.
   Triggers: "分析持仓", "能不能买", "该不该买", "买入时机", "卖出时机", "现在能买吗",
   "适合建仓吗", "加仓", "减仓时机", "TradeMind", "trademind", "/trademind",
   "失败库", "复盘入库".
@@ -61,6 +62,7 @@ metadata:
 2. `notes/knowledge/failures/INDEX.md`  
 3. INDEX 命中同代码或同类主题 → 读对应 `failures/*.md`  
 4. **新股买入 / 建仓 / 加仓** → 再读 `decision-template.md`，检查退出条件是否写清  
+5. **新股买入 / 建仓 / 是否按强者跟** → 再读 `principles/strong-stock.md`，按评分表判断是否 ≥7 分、有无否决项  
 
 ### 回复中的「知识库对照」节（仅决策场景必出）
 
@@ -87,10 +89,10 @@ metadata:
 ### 0. 新股买入 / 买卖时机（决策管道，自动带知识库）
 
 ```text
-1) 读知识库：avoid-checklist + failures/INDEX [+ 案例] [+ 买入/加仓则 decision-template]
+1) 读知识库：avoid-checklist + failures/INDEX [+ 案例] [+ 买入/加仓则 decision-template + strong-stock]
 2) quote + indicators + signals <code>
 3) 可选 kline --days 60/90
-4) 输出：事实 → 策略信号 → 买卖时机判断 → 知识库对照 → 情景（等/试/减）
+4) 输出：事实 → 策略信号 → 买卖时机判断 → 知识库对照（含强势打分若适用）→ 情景（等/试/减）
 ```
 
 ```bash
@@ -163,6 +165,9 @@ uv run trademind portfolio sync-ths --probe
 | `notes/knowledge/README.md` | 总览 |
 | `notes/knowledge/principles/avoid-checklist.md` | 应避免行为（**买入/时机决策时必读**） |
 | `notes/knowledge/principles/decision-template.md` | 新开仓/加仓决策填空 |
+| `notes/knowledge/principles/strong-stock.md` | 强势股打分定义（**建仓/强者跟随时必读**） |
+| `notes/knowledge/principles/stop-loss.md` | 止损纪律 |
+| `notes/knowledge/principles/winner-mindset.md` | 赢家思维（心态） |
 | `notes/knowledge/failures/INDEX.md` | 案例索引（**买入/时机决策时必读**） |
 | `notes/knowledge/failures/_template.md` | 新失败案例模板 |
 | `notes/knowledge/failures/*.md` | 单案全文 |

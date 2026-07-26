@@ -17,7 +17,7 @@ from strategy.rules import (
     HARD_SINGLE_WEIGHT,
     MAX_SINGLE_WEIGHT,
     NO_LOSS_EXIT,
-    ST_MAX_WEIGHT,
+
 )
 
 Urgency = Literal["高", "中", "低"]
@@ -225,14 +225,11 @@ def build_execution(
     reason_tag = "技术卖出"
 
     if force_reduce and is_st:
+        # 仅因单日暴跌等触发，不按「压到 5%」目标减
         reason_tag = "ST纪律减仓"
         urgency = "高"
-        if weight_pct > ST_MAX_WEIGHT:
-            target_w = ST_MAX_WEIGHT
-            ratio = max(0.5, min(1.0, 1.0 - ST_MAX_WEIGHT / max(weight_pct, 0.01)))
-        else:
-            ratio = 0.5
-        notes.append("ST 减仓：数量优先；限价贴近现价")
+        ratio = 0.5
+        notes.append("ST 纪律减仓（无仓位%上限）：限价贴近现价")
     elif force_reduce and weight_pct >= HARD_SINGLE_WEIGHT:
         reason_tag = "仓位硬上限"
         urgency = "中"
