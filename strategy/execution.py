@@ -1,8 +1,10 @@
 """E 层执行计划：把「卖出/减仓/买入」落成数量与挂单方式。
 
-成本原则（用户）：
-- 默认不亏本了结：卖出限价 ≥ 成本价
-- 基本面破坏（ST/财务红灯）允许「破例减仓」，但仍优先挂成本价，禁止建议现价/市价砍仓
+止损纪律（用户原则，2026-07-26）：
+- 成本价不是退出锚；止损/技术/纪律卖出可在浮亏中执行
+- 卖出限价默认贴近现价（约下浮 0.5%），不再强制 ≥ 成本
+- 仍避免建议无计划「市价砍仓」；深套禁止摊薄（P3）
+- 若 rules.NO_LOSS_EXIT=True，恢复旧拦截（仅基本面破坏可亏卖）
 - 不构成投资建议
 """
 
@@ -14,6 +16,7 @@ from typing import Literal
 from strategy.rules import (
     HARD_SINGLE_WEIGHT,
     MAX_SINGLE_WEIGHT,
+    NO_LOSS_EXIT,
     ST_MAX_WEIGHT,
 )
 
@@ -52,47 +55,44 @@ def _sell_limit_price(
     cost_price: float | None,
     *,
     fundamental_break: bool,
+    allow_underwater: bool,
 ) -> tuple[float | None, str, list[str]]:
-    """卖出限价：永不建议低于成本的「砍仓价」。
+    """卖出限价。
 
-    Returns:
-        (limit, price_rule, notes)
+    allow_underwater=True（默认新纪律）：贴近现价，可低于成本。
+    allow_underwater=False（旧 NO_LOSS_EXIT）：浮亏挂成本价等待。
     """
     notes: list[str] = []
-    if cost_price is not None and cost_price > 0:
-        cost = float(cost_price)
-        px = float(price) if price and price > 0 else None
-        underwater = px is not None and px < cost
+    cost = float(cost_price) if cost_price and cost_price > 0 else None
+    px = float(price) if price and price > 0 else None
+    underwater = px is not None and cost is not None and px < cost
 
-        if underwater:
-            # 核心：浮亏时挂成本价，不跟现价下浮
-            limit = round(cost, 3)
+    if not allow_underwater and underwater and cost is not None:
+        limit = round(cost, 3)
+        notes.append(
+            f"旧成本纪律：现价 {px:.3f} < 成本 {cost:.3f}，限价挂成本 {limit}"
+        )
+        if fundamental_break:
+            notes.append("基本面破坏破例减仓，仍先挂成本价条件单")
+            return limit, "limit_at_cost_fundamental_break", notes
+        return limit, "limit_at_cost_wait_recovery", notes
+
+    if px is not None:
+        limit = round(px * 0.995, 3)
+        if underwater and cost is not None:
             notes.append(
-                f"成本纪律：现价 {px:.3f} < 成本 {cost:.3f}，"
-                f"限价挂 **成本价 {limit}**，禁止现价/市价锁亏"
+                f"止损可亏卖：现价 {px:.3f} < 成本 {cost:.3f}，"
+                f"限价约 {limit}（贴近现价，不强制 ≥ 成本）"
             )
-            if fundamental_break:
-                notes.append(
-                    "虽基本面破坏允许减仓，仍先挂成本价；"
-                    "若长期无法成交，由你自行决定是否下调，系统不给出现价砍仓建议"
-                )
-                return limit, "limit_at_cost_fundamental_break", notes
-            return limit, "limit_at_cost_wait_recovery", notes
+            return limit, "t1_open_limit_stop_underwater", notes
+        if cost is not None:
+            notes.append(f"限价约 {limit}（现价附近；成本 {cost:.3f} 仅作参考）")
+        else:
+            notes.append(f"限价约 {limit}（现价下浮约 0.5%）")
+        return limit, "t1_open_limit_near_px", notes
 
-        # 已回本或浮盈：限价不低于成本，可略低于现价但仍 ≥ 成本
-        if px is not None:
-            aggressive = round(px * 0.995, 3)
-            limit = max(cost, aggressive)
-            notes.append(f"已不亏：限价 {limit}（不低于成本 {cost:.3f}）")
-            return limit, "t1_open_limit_ge_cost", notes
-
-        return round(cost, 3), "limit_at_cost", notes
-
-    # 无成本信息时退回现价策略（少见）
-    if price and price > 0:
-        return round(float(price) * 0.995, 3), "t1_open_limit_no_cost", [
-            "无成本价字段，限价按现价略下浮；建议补全成本后再执行"
-        ]
+    if cost is not None:
+        return round(cost, 3), "limit_at_cost_no_px", ["无现价，暂挂成本价"]
     return None, "none", ["无法给出限价"]
 
 
@@ -119,23 +119,27 @@ def build_execution(
     elif price is not None and cost_price and cost_price > 0:
         underwater = float(price) < float(cost_price)
 
+    # 新纪律默认允许浮亏卖；仅 NO_LOSS_EXIT 时拦截
+    allow_underwater_sell = not NO_LOSS_EXIT or fundamental_break
+
     notes: list[str] = [
-        "信号日 T 收盘确认；卖单默认挂成本价或以上，不建议现价锁亏",
+        "信号日 T 收盘确认；卖单默认限价贴近现价（约 -0.5%），避免无计划市价",
         "执行计划为规则默认值，请按整手与交易所规则调整",
+        "止损纪律：成本不是退出锚；详见 notes/knowledge/principles/stop-loss.md",
     ]
 
     # ── 持有 ──
     if action in ("观望", "禁止买入") or (not held and action not in ("买入", "加仓")):
         cost = float(cost_price) if cost_price and cost_price > 0 else None
-        hint = "无需挂单（浮亏持有或信号不足）"
-        if held and underwater and cost is not None:
+        hint = "无需挂单（信号不足或持有观望）"
+        if held and underwater:
             hint = (
-                f"持有观望；若要坚持减仓原则，只挂 **成本价 {cost:.3f} 附近** 条件单，"
-                f"现价约 {price}，不现价砍仓"
+                f"持有观望；若个人止损线已触发，可按 stop-loss 纪律"
+                f"在现价附近减仓（现价约 {price}，成本 {cost}）"
             )
-            notes.append("成本纪律：浮亏中不主动锁亏；回本附近再卖，或等基本面破坏再破例")
+            notes.append("无系统卖出信号；是否执行个人结构止损由你对照决策模板")
         if held and pnl_pct is not None and pnl_pct <= -40:
-            notes.append("深套：禁止摊薄加仓；不强制市价砍仓")
+            notes.append("深套：禁止摊薄加仓；补装止损见 stop-loss §6")
         return ExecutionPlan(
             side="持有",
             ratio=0.0,
@@ -143,7 +147,7 @@ def build_execution(
             urgency="低",
             price_rule="none",
             price_hint=hint,
-            limit_price=cost if (held and underwater and cost) else None,
+            limit_price=None,
             cost_price=cost,
             batches=[],
             notes=notes,
@@ -158,7 +162,8 @@ def build_execution(
         else:
             ratio = 0.0
             add_shares = 100
-            notes.append("新建仓默认试探 1 手（100 股）；请按总资金 5% 以内自行缩放")
+            notes.append("新建仓默认试探 1 手（100 股）；请按总资金与止损 R 自行缩放")
+            notes.append("开仓前应写清：结构止损 S + 资金 R + 错证（decision-template 4b）")
         limit = round(float(price) * 1.005, 3) if price and price > 0 else None
         batches = [
             {
@@ -194,8 +199,8 @@ def build_execution(
             notes=notes,
         )
 
-    # 浮亏且非基本面破坏：D1 应已改为观望；双保险
-    if underwater and not fundamental_break:
+    # 旧纪律双保险：浮亏且非基本面破坏 → 不生成卖单
+    if underwater and not allow_underwater_sell:
         cost = float(cost_price) if cost_price and cost_price > 0 else None
         return ExecutionPlan(
             side="持有",
@@ -204,13 +209,14 @@ def build_execution(
             urgency="低",
             price_rule="limit_at_cost_wait_only",
             price_hint=(
-                f"浮亏不卖：可挂成本价 {cost:.3f} 条件单，现价勿砍"
-                if cost else "浮亏不卖：等回本或基本面破坏"
+                f"旧成本纪律：可挂成本价 {cost:.3f} 条件单"
+                if cost
+                else "旧成本纪律：浮亏不卖"
             ),
             limit_price=cost,
             cost_price=cost,
             batches=[],
-            notes=notes + ["成本纪律拦截：未达基本面破坏，不生成亏损市价/现价卖单"],
+            notes=notes + ["NO_LOSS_EXIT 拦截：未生成浮亏现价卖单"],
         )
 
     ratio = 0.35
@@ -226,10 +232,10 @@ def build_execution(
             ratio = max(0.5, min(1.0, 1.0 - ST_MAX_WEIGHT / max(weight_pct, 0.01)))
         else:
             ratio = 0.5
-        notes.append(f"ST 破例减仓：数量可执行，价格仍优先成本价")
+        notes.append("ST 减仓：数量优先；限价贴近现价")
     elif force_reduce and weight_pct >= HARD_SINGLE_WEIGHT:
         reason_tag = "仓位硬上限"
-        urgency = "中"  # 不因仓位用市价锁亏
+        urgency = "中"
         target_w = MAX_SINGLE_WEIGHT
         ratio = max(0.4, min(1.0, 1.0 - MAX_SINGLE_WEIGHT / max(weight_pct, 0.01)))
     elif force_reduce and weight_pct >= MAX_SINGLE_WEIGHT:
@@ -242,7 +248,7 @@ def build_execution(
             reason_tag = "技术卖出+财务红灯"
             ratio = 0.70
             urgency = "高"
-            notes.append("财务红灯破例：可减仓，限价仍按成本价")
+            notes.append("财务红灯：提高减仓比例，限价贴近现价")
         elif fund_level == "yellow":
             reason_tag = "技术卖出+财务黄灯"
             ratio = 0.45
@@ -255,6 +261,9 @@ def build_execution(
         ratio = 0.40
         urgency = "中"
         reason_tag = "纪律减仓"
+
+    if underwater:
+        notes.append("浮亏卖出：按止损纪律执行，成本仅作参考")
 
     sell_shares = _round_lot(int(shares * ratio))
     if sell_shares <= 0 and shares > 0:
@@ -269,7 +278,10 @@ def build_execution(
         ratio = round(sell_shares / shares, 4) if shares else 0
 
     limit, price_rule, price_notes = _sell_limit_price(
-        price, cost_price, fundamental_break=fundamental_break
+        price,
+        cost_price,
+        fundamental_break=fundamental_break,
+        allow_underwater=allow_underwater_sell,
     )
     notes.extend(price_notes)
 
@@ -278,45 +290,27 @@ def build_execution(
     b1 = min(b1, sell_shares)
     b2 = sell_shares - b1
 
-    if underwater and cost is not None:
-        # 浮亏破例：两批都挂成本价，绝不写「市价/现价下浮」
-        batches = [
-            {
-                "batch": 1,
-                "shares": b1,
-                "when": "随时（条件单）",
-                "how": f"限价 **成本价 {cost:.3f}**，不跟现价",
-            },
-        ]
-        if b2 > 0:
-            batches.append({
-                "batch": 2,
-                "shares": b2,
-                "when": "第 1 批成交后或继续挂着",
-                "how": f"继续限价 **≥ {cost:.3f}**；系统不建议降到现价锁亏",
-            })
+    batches = [
+        {
+            "batch": 1,
+            "shares": b1,
+            "when": "T+1 开盘附近（止损已触发则优先执行）",
+            "how": f"限价约 {limit}（贴近现价）",
+        },
+    ]
+    if b2 > 0:
+        batches.append({
+            "batch": 2,
+            "shares": b2,
+            "when": "T+1～T+3",
+            "how": f"限价可贴近 {limit}；勿无计划市价",
+        })
+    price_hint = f"卖 {sell_shares} 股，限价约 {limit}；浮亏亦可执行"
+    if underwater:
         price_hint = (
-            f"浮亏破例减仓：卖 {sell_shares} 股，限价挂成本 **{cost:.3f}**"
-            f"（现价约 {price}，勿市价砍）"
+            f"止损/减仓（浮亏）：卖 {sell_shares} 股，限价约 {limit}"
+            f"（现价约 {price}，成本 {cost}）"
         )
-        price_rule = "limit_at_cost_only"
-    else:
-        batches = [
-            {
-                "batch": 1,
-                "shares": b1,
-                "when": "T+1 开盘附近",
-                "how": f"限价约 {limit}（≥成本）",
-            },
-        ]
-        if b2 > 0:
-            batches.append({
-                "batch": 2,
-                "shares": b2,
-                "when": "T+1～T+3",
-                "how": f"限价仍 ≥ 成本；可贴近 {limit}",
-            })
-        price_hint = f"卖 {sell_shares} 股，限价约 {limit}（不低于成本）；勿现价锁亏"
 
     notes.insert(0, f"触发：{reason_tag}；卖出比例约 {ratio:.0%}（{sell_shares}/{shares} 股）")
 

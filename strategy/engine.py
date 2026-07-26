@@ -447,7 +447,8 @@ def evaluate_code(
         else:
             reasons.insert(0, "信号不足 → 不操作")
 
-    # ── P5 成本纪律：浮亏不主动了结，除非基本面破坏 ──
+    # ── P5 止损纪律：浮亏不拦截技术/纪律卖出（2026-07-26）──
+    # NO_LOSS_EXIT=True 时恢复旧行为（仅基本面破坏可亏卖）。
     if (
         NO_LOSS_EXIT
         and held
@@ -458,42 +459,36 @@ def evaluate_code(
         rule_signals.append(
             RuleSignal(
                 "P5_NO_LOSS_EXIT",
-                "成本纪律（不亏本了结）",
+                "成本纪律（旧：不亏本了结）",
                 "观望",
                 0,
-                f"浮亏中（pnl={pnl_pct if pnl_pct is not None else '价<成本'}）且基本面未破坏"
-                f"（财务={fund_level}，ST={is_st}）→ 不锁定亏损，改为观望；"
-                f"可待回本附近或基本面转红再卖",
+                f"浮亏中且基本面未破坏 → 旧规则拦截卖出（NO_LOSS_EXIT=True）",
             )
         )
         reasons.insert(
             0,
-            "成本纪律：浮亏且基本面未破坏 → 不主动卖出/减仓锁定亏损",
+            "成本纪律（旧）：浮亏且基本面未破坏 → 不主动锁定亏损",
         )
         final = "观望"
         confidence = "中"
         force_reduce = False
-    elif NO_LOSS_EXIT and held and underwater and final in ("卖出", "减仓") and fundamental_break:
+    elif held and final in ("卖出", "减仓"):
         rule_signals.append(
             RuleSignal(
-                "P5_NO_LOSS_EXIT",
-                "成本纪律（不亏本了结）",
+                "P5_STOP_LOSS",
+                "止损纪律（可亏卖）",
                 final,
-                -1,
-                f"浮亏中，但基本面已破坏（财务={fund_level}，ST={is_st}）→ 允许破例{final}",
+                -1 if underwater else 0,
+                (
+                    f"浮亏中允许{final}（pnl={pnl_pct if pnl_pct is not None else '价<成本'}，"
+                    f"财务={fund_level}，ST={is_st}）；成本不作拦截"
+                    if underwater
+                    else f"未浮亏，{final}正常执行"
+                ),
             )
         )
-        reasons.insert(0, "成本纪律破例：基本面破坏，允许浮亏减仓/卖出")
-    elif NO_LOSS_EXIT and held and not underwater:
-        rule_signals.append(
-            RuleSignal(
-                "P5_NO_LOSS_EXIT",
-                "成本纪律（不亏本了结）",
-                "观望",
-                0,
-                "当前未浮亏（价≥成本）→ 卖出不受成本纪律阻止",
-            )
-        )
+        if underwater:
+            reasons.insert(0, "止损纪律：浮亏中技术/纪律卖出可执行，不要求回本")
 
     rule_signals.append(
         RuleSignal(
@@ -562,13 +557,13 @@ def evaluate_portfolio(
     *,
     quotes: list[dict] | None = None,
     positions: list | None = None,
-    max_workers: int = 8,
+    max_workers: int = 4,
 ) -> dict:
     """对全部持仓跑固定策略，并汇总买卖清单。
 
     性能优化：
     - 可复用外部已拉好的 positions / quotes（报告生成路径只请求 1 次行情）
-    - 单票 K 线 + 财报评估用线程池并行（默认 8 路），避免串行 N 次网络 RTT
+    - 单票 K 线 + 财报评估用线程池并行（默认 4 路），避免串行 N 次网络 RTT
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 

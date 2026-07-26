@@ -1,6 +1,8 @@
 """持仓管理：TOML 配置文件加载/保存 + 增删改查。
 
 持仓文件格式 (holdings.toml):
+    cash = 10000.0          # 可选：可用/资金余额（元）
+
     [[positions]]
     code = "600519"
     shares = 100
@@ -28,13 +30,29 @@ class Position:
         return asdict(self)
 
 
+def _load_raw(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def load_cash(path: Path | str | None = None) -> float | None:
+    """读取资金余额；未配置则返回 None。"""
+    path = Path(path or HOLDINGS_PATH)
+    data = _load_raw(path)
+    if "cash" not in data:
+        return None
+    try:
+        return float(data["cash"])
+    except (TypeError, ValueError):
+        return None
+
+
 def load_positions(path: Path | str | None = None) -> list[Position]:
     """从 TOML 读取持仓列表。文件不存在返回空列表。"""
     path = Path(path or HOLDINGS_PATH)
-    if not path.exists():
-        return []
-    with open(path, "rb") as f:
-        data = tomllib.load(f)
+    data = _load_raw(path)
     positions = []
     for p in data.get("positions", []):
         positions.append(
@@ -47,11 +65,23 @@ def load_positions(path: Path | str | None = None) -> list[Position]:
     return positions
 
 
-def save_positions(positions: list[Position], path: Path | str | None = None) -> None:
-    """保存持仓到 TOML。"""
+def save_positions(
+    positions: list[Position],
+    path: Path | str | None = None,
+    cash: float | None = None,
+) -> None:
+    """保存持仓到 TOML。
+
+    cash=None 时保留文件中已有的 cash；显式传入则覆盖。
+    """
     path = Path(path or HOLDINGS_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = {"positions": [p.to_dict() for p in positions]}
+    existing = _load_raw(path)
+    data: dict = {"positions": [p.to_dict() for p in positions]}
+    if cash is not None:
+        data["cash"] = float(cash)
+    elif "cash" in existing:
+        data["cash"] = existing["cash"]
     with open(path, "wb") as f:
         tomli_w.dump(data, f)
 

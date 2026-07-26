@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import sys
 import threading
 import time
 import webbrowser
@@ -24,7 +26,12 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "notes" / "reports"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LATEST_NAME = "portfolio_latest.html"
+
+# 完整生成含多票 K 线，可能较慢；给子进程留足超时
+_REGEN_TIMEOUT_FAST_S = 180
+_REGEN_TIMEOUT_FULL_S = 600
 
 _regen_lock = threading.Lock()
 _regen_status: dict = {
@@ -62,15 +69,106 @@ def list_history() -> list[dict]:
     return items
 
 
-def regenerate(*, include_signals: bool = True, days: int = 90) -> Path:
-    """同步生成（内部/启动用）。
+def _signal_name(returncode: int) -> str:
+    """负 returncode 表示被信号杀死（如 -5 = SIGTRAP）。"""
+    if returncode >= 0:
+        return ""
+    sig = -returncode
+    try:
+        import signal
 
-    注意：长驻 serve 进程会缓存已 import 的模块。每次生成前强制 reload
-    html 模板相关模块，避免「完整生成」仍写出旧版 HTML。
+        return signal.Signals(sig).name
+    except Exception:
+        return f"signal {sig}"
+
+
+def regenerate_subprocess(*, include_signals: bool = True, days: int = 90) -> Path:
+    """在独立子进程中生成报告。
+
+    隔离 py_mini_racer/V8 等原生崩溃：子进程挂掉不会拖死 HTTP serve。
+    """
+    cmd = [
+        sys.executable,
+        "-m",
+        "report.regen_worker",
+        "--days",
+        str(int(days)),
+    ]
+    if include_signals:
+        cmd.append("--signals")
+
+    timeout = _REGEN_TIMEOUT_FULL_S if include_signals else _REGEN_TIMEOUT_FAST_S
+    print(
+        f"[report-server] 子进程生成启动 signals={include_signals} "
+        f"timeout={timeout}s cmd={' '.join(cmd)}"
+    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(PROJECT_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"报告生成超时（>{timeout}s）") from e
+
+    if proc.stderr:
+        for line in proc.stderr.strip().splitlines()[-20:]:
+            print(f"[report-server][worker] {line}")
+
+    if proc.returncode != 0:
+        sig = _signal_name(proc.returncode)
+        detail = (proc.stderr or proc.stdout or "").strip()
+        if sig:
+            msg = (
+                f"生成子进程异常退出 ({sig}, code={proc.returncode})。"
+                f"服务仍在运行，可重试。详情: {detail[:500]}"
+            )
+        else:
+            msg = detail[-800:] if detail else f"子进程退出码 {proc.returncode}"
+        raise RuntimeError(msg)
+
+    lines = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+    if lines:
+        path = Path(lines[-1])
+        if path.is_file():
+            return path
+    # 子进程可能只写了 latest 而未打印路径
+    lp = latest_path()
+    if lp.is_file():
+        return lp
+    raise RuntimeError("子进程已结束但未找到报告文件")
+
+
+def regenerate(
+    *,
+    include_signals: bool = True,
+    days: int = 90,
+    isolated: bool = False,
+) -> Path:
+    """同步生成。
+
+    Args:
+        isolated: True 时走子进程（推荐用于 /refresh 后台任务）；
+            False 时在本进程内生成（启动时快速生成可用）。
+            本进程路径会 reload 模板模块，避免长驻 serve 写出旧 HTML。
     """
     import importlib
-    import sys
     import time as _time
+
+    if isolated:
+        t0 = _time.time()
+        path = regenerate_subprocess(include_signals=include_signals, days=days)
+        elapsed = _time.time() - t0
+        print(
+            f"[report-server] write_portfolio_report (subprocess) done in "
+            f"{elapsed:.2f}s signals={include_signals} → {path}"
+        )
+        _regen_status["last_ok_at"] = datetime.now().isoformat(timespec="seconds")
+        _regen_status["last_error"] = None
+        _regen_status["last_elapsed_s"] = round(elapsed, 2)
+        return path
 
     # 强制重载模板与依赖，确保磁盘上的新格式立即生效
     for mod_name in (
@@ -113,7 +211,7 @@ def regenerate(*, include_signals: bool = True, days: int = 90) -> Path:
 
 
 def start_regenerate_async(*, include_signals: bool = False, days: int = 90) -> bool:
-    """后台生成。返回 True 表示已启动；False 表示已有任务在跑。"""
+    """后台生成（子进程隔离）。返回 True 表示已启动；False 表示已有任务在跑。"""
     with _regen_lock:
         if _regen_status["running"]:
             return False
@@ -126,10 +224,14 @@ def start_regenerate_async(*, include_signals: bool = False, days: int = 90) -> 
         try:
             print(
                 f"[report-server] 后台生成开始 mode={_regen_status['mode']} "
-                f"signals={include_signals}"
+                f"signals={include_signals} isolated=1"
             )
             t0 = time.time()
-            path = regenerate(include_signals=include_signals, days=days)
+            path = regenerate(
+                include_signals=include_signals,
+                days=days,
+                isolated=True,
+            )
             print(f"[report-server] 后台生成完成 {time.time() - t0:.1f}s → {path}")
         except Exception as e:
             _regen_status["last_error"] = str(e)

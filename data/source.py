@@ -1,13 +1,15 @@
 """A股数据源封装。
 
-数据源选型（基于实测连通性）：
-- 历史K线：新浪 (stock_zh_a_daily)，东方财富 push2his 端点在部分网络不可达
+数据源选型：
+- 历史K线：首选东财 stock_zh_a_hist（无 V8）；备选新浪 stock_zh_a_daily
+  （新浪依赖 py_mini_racer，进程内串行，避免 macOS 并发 SIGTRAP）
 - 实时行情：新浪 hq.sinajs.cn，失败降级到腾讯 qt.gtimg.cn，再降级到最近K线收盘价
 
 统一处理 A 股代码归一化、缓存、重试。
 """
 
 import re
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -16,6 +18,10 @@ import pandas as pd
 import requests
 
 from data import cache
+
+# 新浪日线依赖 py_mini_racer (V8)。多线程同时创建 Isolate 会在 macOS 上
+# 触发 partition_alloc SIGTRAP，拖死整个进程。串行化新浪 K 线请求。
+_sina_kline_lock = threading.Lock()
 
 
 def _retry(fn, *args, retries: int = 3, delay: float = 1.5, **kwargs):
@@ -65,16 +71,68 @@ def _to_sina_symbol(code: str) -> str:
     return f"sz{code}"
 
 
+def _kline_from_eastmoney(
+    code: str, period: str, start: str, end: str, adjust: str
+) -> pd.DataFrame | None:
+    """东方财富历史 K 线（无 MiniRacer）。失败返回 None。"""
+    try:
+        df = _retry(
+            ak.stock_zh_a_hist,
+            symbol=code,
+            period=period,
+            start_date=start,
+            end_date=end,
+            adjust=adjust,
+        )
+        rename = {
+            "日期": "date",
+            "股票代码": "code",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "volume",
+            "成交额": "amount",
+            "振幅": "amplitude",
+            "涨跌幅": "pct_change",
+            "涨跌额": "change",
+            "换手率": "turnover",
+        }
+        return df.rename(columns=rename)
+    except Exception:
+        return None
+
+
+def _kline_from_sina(
+    code: str, start: str, end: str, adjust: str
+) -> pd.DataFrame | None:
+    """新浪日线（内部 MiniRacer/V8）。必须串行调用。失败返回 None。"""
+    try:
+        sina_sym = _to_sina_symbol(code)
+        with _sina_kline_lock:
+            return _retry(
+                ak.stock_zh_a_daily,
+                symbol=sina_sym,
+                start_date=start,
+                end_date=end,
+                adjust=adjust,
+            )
+    except Exception:
+        return None
+
+
 def get_kline(
     code: str, period: str = "daily", days: int = 60, adjust: str = "qfq"
 ) -> pd.DataFrame:
     """获取历史 K 线（OHLCV）。
 
-    使用新浪源 stock_zh_a_daily。
+    数据源策略（避免 macOS 上 py_mini_racer/V8 崩溃）：
+    - 首选东方财富 stock_zh_a_hist（无 V8，可并行）
+    - 备选新浪 stock_zh_a_daily（需 MiniRacer，进程内串行）
 
     Args:
         code: 股票代码（6 位）
-        period: daily / weekly / monthly（新浪源仅日线直接支持，非日线回退到东财）
+        period: daily / weekly / monthly
         days: 近 N 个交易日
         adjust: qfq 前复权 / hfq 后复权 / "" 不复权
     """
@@ -86,36 +144,17 @@ def get_kline(
     end = datetime.now().strftime("%Y%m%d")
     start = (datetime.now() - timedelta(days=int(days * 1.6) + 30)).strftime("%Y%m%d")
 
-    df = None
-    # 首选：新浪源
-    if period == "daily":
-        try:
-            sina_sym = _to_sina_symbol(code)
-            df = _retry(
-                ak.stock_zh_a_daily,
-                symbol=sina_sym, start_date=start, end_date=end, adjust=adjust,
-            )
-        except Exception:
-            df = None
+    # 首选：东财（无 MiniRacer）
+    df = _kline_from_eastmoney(code, period, start, end, adjust)
 
-    # 备选：东方财富源
+    # 备选：新浪日线（串行 MiniRacer）
+    if df is None and period == "daily":
+        df = _kline_from_sina(code, start, end, adjust)
+
     if df is None:
-        try:
-            df = _retry(
-                ak.stock_zh_a_hist,
-                symbol=code, period=period, start_date=start, end_date=end, adjust=adjust,
-            )
-            # 东财列名是中文，统一成英文
-            rename = {
-                "日期": "date", "股票代码": "code", "开盘": "open", "收盘": "close",
-                "最高": "high", "最低": "low", "成交量": "volume", "成交额": "amount",
-                "振幅": "amplitude", "涨跌幅": "pct_change", "涨跌额": "change", "换手率": "turnover",
-            }
-            df = df.rename(columns=rename)
-        except Exception:
-            if cached is not None and not cached.empty:
-                return cached.tail(days).reset_index(drop=True)
-            raise RuntimeError(f"无法获取 {code} 的历史K线（新浪/东财均不可达）")
+        if cached is not None and not cached.empty:
+            return cached.tail(days).reset_index(drop=True)
+        raise RuntimeError(f"无法获取 {code} 的历史K线（东财/新浪均不可达）")
 
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"])
