@@ -1,7 +1,8 @@
 """A股数据源封装。
 
 数据源选型：
-- 历史K线：首选东财 stock_zh_a_hist（无 V8）；备选新浪 stock_zh_a_daily
+- 历史K线：首选 mootdx/通达信 TCP（快、不封 IP，对齐 a-stock-data）；
+  备选东财 stock_zh_a_hist；再备选新浪 stock_zh_a_daily
   （新浪依赖 py_mini_racer，进程内串行，避免 macOS 并发 SIGTRAP）
 - 实时行情：新浪 hq.sinajs.cn，失败降级到腾讯 qt.gtimg.cn，再降级到最近K线收盘价
 
@@ -23,6 +24,20 @@ from data import cache
 # 触发 partition_alloc SIGTRAP，拖死整个进程。串行化新浪 K 线请求。
 _sina_kline_lock = threading.Lock()
 
+# mootdx 客户端：线程本地，避免多线程共用一个 TCP 连接
+_mootdx_local = threading.local()
+_mootdx_init_lock = threading.Lock()
+_mootdx_available: bool | None = None  # None=未探测, True/False=结果
+
+# mootdx frequency：9=日, 5=周, 6=月（与库内约定一致）
+_MOOTDX_FREQ = {
+    "daily": 9,
+    "week": 5,
+    "weekly": 5,
+    "month": 6,
+    "monthly": 6,
+}
+
 
 def _retry(fn, *args, retries: int = 3, delay: float = 1.5, **kwargs):
     """请求偶发断连，做简单重试。"""
@@ -35,6 +50,94 @@ def _retry(fn, *args, retries: int = 3, delay: float = 1.5, **kwargs):
             if i < retries - 1:
                 time.sleep(delay)
     raise last_err  # type: ignore[misc]
+
+
+def _get_mootdx_client():
+    """线程本地 Quotes 客户端；首次失败则全局标记不可用。"""
+    global _mootdx_available
+    if _mootdx_available is False:
+        return None
+    client = getattr(_mootdx_local, "client", None)
+    if client is not None:
+        return client
+    with _mootdx_init_lock:
+        if _mootdx_available is False:
+            return None
+        try:
+            from mootdx.quotes import Quotes
+
+            client = Quotes.factory(market="std")
+            # 验活：必须能真实取到一根 K，避免空连接
+            probe = client.bars(symbol="000001", frequency=9, offset=1)
+            if probe is None or (hasattr(probe, "empty") and probe.empty):
+                raise RuntimeError("mootdx probe empty")
+            _mootdx_local.client = client
+            _mootdx_available = True
+            return client
+        except Exception:
+            _mootdx_available = False
+            return None
+
+
+def _normalize_kline_df(df: pd.DataFrame) -> pd.DataFrame:
+    """统一为 date/open/high/low/close/volume[/amount]。"""
+    out = df.copy()
+    rename: dict[str, str] = {}
+    cols_lower = {str(c).lower(): c for c in out.columns}
+    for want, aliases in {
+        "date": ("date", "datetime", "day", "日期"),
+        "open": ("open", "开盘"),
+        "high": ("high", "最高"),
+        "low": ("low", "最低"),
+        "close": ("close", "收盘"),
+        "volume": ("volume", "vol", "成交量"),
+        "amount": ("amount", "成交额"),
+    }.items():
+        if want in out.columns:
+            continue
+        for a in aliases:
+            if a in out.columns:
+                rename[a] = want
+                break
+            if a.lower() in cols_lower:
+                rename[cols_lower[a.lower()]] = want
+                break
+    if rename:
+        out = out.rename(columns=rename)
+    if "date" not in out.columns:
+        raise ValueError("K 线缺少 date 列")
+    out["date"] = pd.to_datetime(out["date"])
+    keep = [c for c in ("date", "open", "high", "low", "close", "volume", "amount") if c in out.columns]
+    out = out[keep].sort_values("date").reset_index(drop=True)
+    for c in ("open", "high", "low", "close", "volume", "amount"):
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out
+
+
+def _kline_from_mootdx(code: str, period: str, days: int) -> pd.DataFrame | None:
+    """通达信 TCP 日/周/月 K 线。失败返回 None。
+
+    注意：mootdx 返回的是不复权行情；短中期技术指标可用。
+    需要精确前复权时，若本源失败会落到东财 qfq。
+    """
+    freq = _MOOTDX_FREQ.get(period)
+    if freq is None:
+        return None
+    client = _get_mootdx_client()
+    if client is None:
+        return None
+    # 多取一些，过滤后仍够 days；通达信 offset 上限约 800
+    offset = min(max(int(days) + 30, 30), 800)
+    try:
+        raw = client.bars(symbol=code, frequency=freq, offset=offset)
+        if raw is None or (hasattr(raw, "empty") and raw.empty):
+            return None
+        if not isinstance(raw, pd.DataFrame):
+            raw = pd.DataFrame(raw)
+        return _normalize_kline_df(raw)
+    except Exception:
+        return None
 
 
 def normalize_code(code: str) -> str:
@@ -126,15 +229,18 @@ def get_kline(
 ) -> pd.DataFrame:
     """获取历史 K 线（OHLCV）。
 
-    数据源策略（避免 macOS 上 py_mini_racer/V8 崩溃）：
-    - 首选东方财富 stock_zh_a_hist（无 V8，可并行）
-    - 备选新浪 stock_zh_a_daily（需 MiniRacer，进程内串行）
+    数据源策略（速度优先，对齐 a-stock-data）：
+    1. 本地 SQLite 缓存
+    2. mootdx / 通达信 TCP（首选，快且不封 IP，可并行）
+    3. 东财 stock_zh_a_hist（前复权更完整时作补充）
+    4. 新浪 stock_zh_a_daily（MiniRacer，进程内串行）
 
     Args:
         code: 股票代码（6 位）
         period: daily / weekly / monthly
         days: 近 N 个交易日
         adjust: qfq 前复权 / hfq 后复权 / "" 不复权
+            （mootdx 路径为不复权；东财/新浪尊重该参数）
     """
     code = normalize_code(code)
     cached = cache.get_kline_cache(code, period, adjust)
@@ -144,21 +250,36 @@ def get_kline(
     end = datetime.now().strftime("%Y%m%d")
     start = (datetime.now() - timedelta(days=int(days * 1.6) + 30)).strftime("%Y%m%d")
 
-    # 首选：东财（无 MiniRacer）
-    df = _kline_from_eastmoney(code, period, start, end, adjust)
+    df: pd.DataFrame | None = None
 
-    # 备选：新浪日线（串行 MiniRacer）
-    if df is None and period == "daily":
-        df = _kline_from_sina(code, start, end, adjust)
+    # 1) mootdx 通达信（日/周/月）
+    df = _kline_from_mootdx(code, period, days)
 
-    if df is None:
+    # 2) 东财（无 MiniRacer；可取前复权）
+    if df is None or len(df) < min(days, 5):
+        em = _kline_from_eastmoney(code, period, start, end, adjust)
+        if em is not None and not em.empty:
+            df = em
+
+    # 3) 新浪日线（串行 MiniRacer）
+    if (df is None or len(df) < min(days, 5)) and period == "daily":
+        sina = _kline_from_sina(code, start, end, adjust)
+        if sina is not None and not sina.empty:
+            df = sina
+
+    if df is None or (hasattr(df, "empty") and df.empty):
         if cached is not None and not cached.empty:
             return cached.tail(days).reset_index(drop=True)
-        raise RuntimeError(f"无法获取 {code} 的历史K线（东财/新浪均不可达）")
+        raise RuntimeError(
+            f"无法获取 {code} 的历史K线（mootdx/东财/新浪均不可达）"
+        )
 
     df = df.copy()
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").reset_index(drop=True)
+    if "date" not in df.columns:
+        df = _normalize_kline_df(df)
+    else:
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date").reset_index(drop=True)
 
     cache.set_kline_cache(code, period, adjust, df)
     return df.tail(days).reset_index(drop=True)

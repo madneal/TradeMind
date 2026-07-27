@@ -649,13 +649,13 @@ def evaluate_portfolio(
     *,
     quotes: list[dict] | None = None,
     positions: list | None = None,
-    max_workers: int = 4,
+    max_workers: int = 8,
 ) -> dict:
     """对全部持仓跑固定策略，并汇总买卖清单。
 
     性能优化：
     - 可复用外部已拉好的 positions / quotes（报告生成路径只请求 1 次行情）
-    - 单票 K 线 + 财报评估用线程池并行（默认 4 路），避免串行 N 次网络 RTT
+    - 单票 K 线 + 财报评估用线程池并行（默认 8 路；K 线优先 mootdx，可并行）
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
