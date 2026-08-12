@@ -696,9 +696,15 @@ def evaluate_portfolio(
             "industry": industry,
         })
 
+    cash = load_cash()
+    cash_f = float(cash) if cash is not None else 0.0
+    total_assets = total_mv + cash_f if total_mv else cash_f
+    # 仓位占比分母：有现金时用总资产（对齐券商/dashboard）；否则用总市值
+    weight_base = total_assets if cash is not None and total_assets > 0 else total_mv
+
     gold_mv = 0.0
     for it in items:
-        w = (it["mv"] / total_mv * 100) if total_mv else 0
+        w = (it["mv"] / weight_base * 100) if weight_base else 0
         it["weight_pct"] = w
         cost = it["pos"].cost_price * it["pos"].shares
         it["pnl_pct"] = ((it["mv"] - cost) / cost * 100) if cost else None
@@ -706,11 +712,7 @@ def evaluate_portfolio(
             it["pnl_pct"] = None
         if _is_gold_theme(it["pos"].code, it["name"], it["industry"]):
             gold_mv += it["mv"]
-    gold_theme_weight = (gold_mv / total_mv * 100) if total_mv else 0
-
-    cash = load_cash()
-    cash_f = float(cash) if cash is not None else 0.0
-    total_assets = total_mv + cash_f if total_mv else cash_f
+    gold_theme_weight = (gold_mv / weight_base * 100) if weight_base else 0
 
     def _eval_one(it: dict) -> dict:
         p = it["pos"]

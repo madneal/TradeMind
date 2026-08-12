@@ -23,6 +23,8 @@ build/
 
 # Personal holdings (do not commit)
 holdings.toml
+watchlist.toml
+closed.toml
 
 # Personal notes / conversation logs (do not commit)
 notes/

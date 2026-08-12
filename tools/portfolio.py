@@ -21,10 +21,26 @@ def _load_and_quote() -> tuple[list, list]:
     return positions, quotes
 
 
-def portfolio_overview_from(positions: list, quotes: list) -> dict:
-    """用已有 positions + quotes 组装持仓概览（不再请求网络）。"""
+def portfolio_overview_from(
+    positions: list,
+    quotes: list,
+    *,
+    cash: float | None = None,
+) -> dict:
+    """用已有 positions + quotes 组装持仓概览（不再请求网络）。
+
+    仓位占比 weight_pct = 市值 / 总资产（总市值+现金）；无现金时退化为 / 总市值。
+    """
     if not positions:
         return {"message": "持仓为空，请先用 add 命令添加持仓（uv run trademind portfolio add 600519 100 1500）"}
+
+    if cash is None:
+        try:
+            from portfolio import load_cash
+
+            cash = load_cash()
+        except Exception:
+            cash = None
 
     quote_map = {q["code"]: q for q in quotes}
     total_market_value = 0.0
@@ -61,13 +77,47 @@ def portfolio_overview_from(positions: list, quotes: list) -> dict:
             "market_value": round(market_value, 2),
         })
 
+    cash_f = float(cash) if cash is not None else 0.0
+    total_assets = total_market_value + cash_f
+    # 分母：有现金配置时用总资产（对齐券商「仓位占比」）；否则用总市值
+    weight_base = total_assets if cash is not None else total_market_value
+
+    total_day_pnl = 0.0
+    day_pnl_known = True
     for item in items:
         item["weight_pct"] = (
-            round(item["market_value"] / total_market_value * 100, 2) if total_market_value else 0
+            round(item["market_value"] / weight_base * 100, 2) if weight_base else 0
         )
+        if item.get("day_pnl") is None:
+            day_pnl_known = False
+        else:
+            total_day_pnl += float(item["day_pnl"])
+
+    # 今日盈亏比率：相对昨收市值 = 总市值 - 今日盈亏
+    total_day_pnl_pct = None
+    if day_pnl_known and items:
+        prev_mv = total_market_value - total_day_pnl
+        if prev_mv:
+            total_day_pnl_pct = round(total_day_pnl / prev_mv * 100, 2)
+        else:
+            total_day_pnl_pct = 0.0
+        total_day_pnl = round(total_day_pnl, 2)
+    else:
+        total_day_pnl = None
+
+    position_ratio = (
+        round(total_market_value / total_assets * 100, 2) if total_assets else 0.0
+    )
+    cash_pct = round(cash_f / total_assets * 100, 2) if total_assets and cash is not None else None
 
     return {
         "total_market_value": round(total_market_value, 2),
+        "cash": round(cash_f, 2) if cash is not None else None,
+        "total_assets": round(total_assets, 2) if cash is not None else round(total_market_value, 2),
+        "position_ratio": position_ratio if cash is not None else 100.0,
+        "cash_pct": cash_pct,
+        "total_day_pnl": total_day_pnl,
+        "total_day_pnl_pct": total_day_pnl_pct,
         "count": len(items),
         "positions": items,
     }
@@ -116,12 +166,28 @@ def portfolio_pnl_from(positions: list, quotes: list) -> dict:
     }
 
 
-def portfolio_risk_from(positions: list, quotes: list) -> dict:
-    """用已有 positions + quotes 组装风险（不再请求网络）。"""
+def portfolio_risk_from(
+    positions: list,
+    quotes: list,
+    *,
+    cash: float | None = None,
+) -> dict:
+    """用已有 positions + quotes 组装风险（不再请求网络）。
+
+    单票/行业占比默认相对总资产（含现金）；HHI 仍按行业市值在总市值内集中度计算。
+    """
     from data.industry import get_industry
 
     if not positions:
         return {"message": "持仓为空"}
+
+    if cash is None:
+        try:
+            from portfolio import load_cash
+
+            cash = load_cash()
+        except Exception:
+            cash = None
 
     quote_map = {q["code"]: q for q in quotes}
     total_market_value = 0.0
@@ -142,9 +208,13 @@ def portfolio_risk_from(positions: list, quotes: list) -> dict:
             "weight_pct": 0,
         })
 
+    cash_f = float(cash) if cash is not None else 0.0
+    total_assets = total_market_value + cash_f
+    weight_base = total_assets if cash is not None else total_market_value
+
     industry_items = []
     for ind, val in sorted(industry_value.items(), key=lambda x: x[1], reverse=True):
-        pct = round(val / total_market_value * 100, 2) if total_market_value else 0
+        pct = round(val / weight_base * 100, 2) if weight_base else 0
         industry_items.append({"industry": ind, "market_value": round(val, 2), "weight_pct": pct})
 
     hhi = (
@@ -156,7 +226,7 @@ def portfolio_risk_from(positions: list, quotes: list) -> dict:
 
     for item in item_details:
         item["weight_pct"] = (
-            round(item["market_value"] / total_market_value * 100, 2) if total_market_value else 0
+            round(item["market_value"] / weight_base * 100, 2) if weight_base else 0
         )
 
     warnings = []
@@ -168,12 +238,20 @@ def portfolio_risk_from(positions: list, quotes: list) -> dict:
     if len(positions) < 3:
         warnings.append(f"持仓数量较少（{len(positions)} 只），分散化不足")
     industry_top = industry_items[0]["weight_pct"] if industry_items else 0
-    if industry_top > 50:
-        warnings.append(f"单一行业占比过高（{industry_top}%），行业风险集中")
+    # 有现金时行业占比按总资产计，阈值仍按「行业占权益过高」用市值口径近似
+    industry_top_mv = (
+        round(industry_items[0]["market_value"] / total_market_value * 100, 2)
+        if industry_items and total_market_value
+        else 0
+    )
+    if industry_top_mv > 50:
+        warnings.append(f"单一行业占比过高（{industry_top_mv}% 市值口径），行业风险集中")
 
     return {
         "count": len(positions),
         "total_market_value": round(total_market_value, 2),
+        "cash": round(cash_f, 2) if cash is not None else None,
+        "total_assets": round(total_assets, 2) if cash is not None else round(total_market_value, 2),
         "industry_distribution": industry_items,
         "hhi": int(hhi),
         "max_single_weight": single_max,

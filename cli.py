@@ -14,6 +14,12 @@
 - uv run trademind strategies                  列出固定策略规则
 - uv run trademind backtest 518880             单票历史回测（技术规则）
 - uv run trademind backtest                    持仓分票历史回测
+- uv run trademind review                 每日复盘（市场+持仓+纪律）
+- uv run trademind buy 600519             买入管道（底稿+强势+F1+decide）
+- uv run trademind debate 600519          多空辩论+规则收尾
+- uv run trademind scan-strong            扫描当日纪律内强势股
+- uv run trademind watch list|add|remove  自选股
+- uv run trademind closed list|add        已清仓账本
 """
 
 import typer
@@ -273,6 +279,11 @@ def report_cmd(
         "--no-signals",
         help="不跑固定策略（更快，仅行情/盈亏/风险）",
     ),
+    no_market: bool = typer.Option(
+        False,
+        "--no-market",
+        help="不拉市场复盘（指数/板块/情绪）",
+    ),
     no_open: bool = typer.Option(
         False,
         "--no-open",
@@ -283,11 +294,17 @@ def report_cmd(
     """生成持仓分析 HTML 报告（单文件，可本地打开分享）。"""
     from report.html_report import write_portfolio_report
 
-    console.print("[dim]正在拉取持仓/行情" + (" + 策略信号…" if not no_signals else "…") + "[/dim]")
+    bits = ["持仓/行情"]
+    if not no_signals:
+        bits.append("策略")
+    if not no_market:
+        bits.append("市场")
+    console.print("[dim]正在拉取 " + " + ".join(bits) + "…[/dim]")
     try:
         path = write_portfolio_report(
             output,
             include_signals=not no_signals,
+            include_market=not no_market,
             days=days,
             open_browser=not no_open,
         )
@@ -471,6 +488,251 @@ def _print_backtest_one(r: dict) -> None:
         console.print(table)
     for n in r.get("notes") or []:
         console.print(f"[dim]• {n}[/dim]")
+
+
+@app.command("buy")
+def buy_cmd(
+    code: str = typer.Argument(..., help="6 位代码"),
+    days: int = typer.Option(90, help="K 线天数"),
+    output: str | None = typer.Option(None, "--output", "-o", help="可选 Markdown 路径"),
+):
+    """买入/建仓管道：底稿 → 强势 → F1 → decide → 知识库提醒。"""
+    from strategy.pipeline import run_buy_pipeline, pipeline_to_markdown
+    from data.source import normalize_code
+
+    code = normalize_code(code)
+    console.print(f"[dim]买入管道评估 {code}…[/dim]")
+    try:
+        data = run_buy_pipeline(code, days=days)
+    except Exception as e:
+        console.print(f"[red]失败：{e}[/red]")
+        raise typer.Exit(1) from e
+    md = pipeline_to_markdown("buy", data)
+    if output:
+        from pathlib import Path
+
+        p = Path(output)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(md, encoding="utf-8")
+        console.print(f"[green]✓ 已写入[/green] {p}")
+    console.print(Panel(
+        f"[bold]{data.get('pipeline_tag')}[/bold]\n"
+        f"强势分 {((data.get('strong') or {}).get('score'))} · "
+        f"财务 {((data.get('dossier') or {}).get('fundamentals') or {}).get('level')} · "
+        f"规则 {(data.get('decision') or {}).get('action')}",
+        title=f"{data.get('code')} {data.get('name')}",
+        border_style="cyan",
+    ))
+    console.print(Markdown(md))
+
+
+@app.command("debate")
+def debate_cmd(
+    code: str = typer.Argument(..., help="6 位代码"),
+    days: int = typer.Option(90, help="K 线天数"),
+    output: str | None = typer.Option(None, "--output", "-o"),
+):
+    """多空辩论（规则化）+ decide 收尾。"""
+    from strategy.pipeline import run_debate, pipeline_to_markdown
+    from data.source import normalize_code
+
+    code = normalize_code(code)
+    console.print(f"[dim]辩论 {code}…[/dim]")
+    try:
+        data = run_debate(code, days=days)
+    except Exception as e:
+        console.print(f"[red]失败：{e}[/red]")
+        raise typer.Exit(1) from e
+    md = pipeline_to_markdown("debate", data)
+    if output:
+        from pathlib import Path
+
+        p = Path(output)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(md, encoding="utf-8")
+        console.print(f"[green]✓ 已写入[/green] {p}")
+    rd = data.get("rule_decision") or {}
+    console.print(Panel(
+        f"规则收尾：**{rd.get('action')}**（{rd.get('confidence')}）",
+        title=f"辩论 {data.get('code')} {data.get('name')}",
+        border_style="magenta",
+    ))
+    console.print(Markdown(md))
+
+
+@app.command("scan-strong")
+def scan_strong_cmd(
+    min_score: int = typer.Option(7, "--min-score", help="强势分下限"),
+    top: int = typer.Option(12, "--top", help="preferred 最多条数"),
+):
+    """扫描当日强势池并过 F0/F1 纪律过滤。"""
+    from strategy.scan_strong import scan_strong_market
+
+    console.print("[dim]扫描市场强势股（可能需 1–3 分钟）…[/dim]")
+    try:
+        data = scan_strong_market(min_score=min_score, top_n=top)
+    except Exception as e:
+        console.print(f"[red]失败：{e}[/red]")
+        raise typer.Exit(1) from e
+    if data.get("error"):
+        console.print(f"[red]{data['error']}[/red]")
+        raise typer.Exit(1)
+    console.print(
+        f"样本日 {data.get('hot_date')} · 评分池 {data.get('universe')} · "
+        f"≥{min_score} 存活 {data.get('survivors')}"
+    )
+    themes = data.get("themes") or []
+    if themes:
+        console.print("题材: " + " · ".join(f"{t['tag']}({t['count']})" for t in themes[:8]))
+    table = Table(title="纪律内强势（preferred）", show_lines=True)
+    table.add_column("代码")
+    table.add_column("名称")
+    table.add_column("分", justify="right")
+    table.add_column("今日%", justify="right")
+    table.add_column("财务")
+    table.add_column("题材")
+    for r in data.get("preferred") or []:
+        table.add_row(
+            str(r.get("code")),
+            str(r.get("name") or ""),
+            str(r.get("score")),
+            f"{r.get('pct')}",
+            str(r.get("fund_level")),
+            str(r.get("reason") or "")[:40],
+        )
+    console.print(table)
+    y = data.get("watch_yellow") or []
+    if y:
+        console.print(f"[yellow]黄灯观察 {len(y)} 只（禁常规加仓）[/yellow]")
+    rej = data.get("rejected_fund") or []
+    if rej:
+        console.print(f"[red]财务红灯剔除 {len(rej)} 只[/red]")
+    console.print(f"[dim]{data.get('disclaimer')}[/dim]")
+
+
+# ── watchlist ──
+watch_app = typer.Typer(help="自选股 watchlist.toml", no_args_is_help=True)
+app.add_typer(watch_app, name="watch")
+
+
+@watch_app.command("list")
+def watch_list():
+    from watchlist import load_watchlist
+
+    codes = load_watchlist()
+    if not codes:
+        console.print("[dim]自选为空。uv run trademind watch add 600519,000858[/dim]")
+        return
+    console.print("自选: " + ", ".join(codes))
+
+
+@watch_app.command("add")
+def watch_add(codes: str = typer.Argument(..., help="代码，逗号/空格分隔")):
+    from watchlist import add_watch
+
+    cur = add_watch(codes)
+    console.print(f"[green]✓ 自选共 {len(cur)} 只[/green]: " + ", ".join(cur))
+
+
+@watch_app.command("remove")
+def watch_remove(code: str = typer.Argument(...)):
+    from watchlist import remove_watch
+
+    cur = remove_watch(code)
+    console.print(f"[green]✓ 已移除[/green] 剩余: " + (", ".join(cur) if cur else "空"))
+
+
+# ── closed ledger ──
+closed_app = typer.Typer(help="已清仓账本 closed.toml", no_args_is_help=True)
+app.add_typer(closed_app, name="closed")
+
+
+@closed_app.command("list")
+def closed_list():
+    from closed_ledger import load_closed
+
+    rows = load_closed()
+    if not rows:
+        console.print("[dim]账本为空。清仓时可：trademind closed add …[/dim]")
+        return
+    table = Table(title="已清仓", show_lines=True)
+    table.add_column("日期")
+    table.add_column("代码")
+    table.add_column("名称")
+    table.add_column("成本", justify="right")
+    table.add_column("卖出价", justify="right")
+    table.add_column("盈亏%", justify="right")
+    table.add_column("备注")
+    for r in rows:
+        pct = r.pnl_pct
+        table.add_row(
+            r.closed_date,
+            r.code,
+            r.name,
+            f"{r.cost_price:.3f}",
+            f"{r.exit_price:.3f}",
+            f"{pct:+.1f}%" if pct is not None else "—",
+            r.note[:30],
+        )
+    console.print(table)
+
+
+@closed_app.command("add")
+def closed_add(
+    code: str = typer.Argument(...),
+    shares: int = typer.Argument(...),
+    cost_price: float = typer.Argument(...),
+    exit_price: float = typer.Argument(...),
+    note: str = typer.Option("", "--note", "-n"),
+):
+    """登记一笔已清仓。"""
+    from closed_ledger import add_closed
+    from data.source import get_quote
+
+    name = ""
+    try:
+        name = (get_quote(code) or {}).get("name") or ""
+    except Exception:
+        pass
+    row = add_closed(code, shares, cost_price, exit_price, name=name, note=note)
+    console.print(
+        f"[green]✓ 已记清仓[/green] {row.code} {row.shares}股 "
+        f"{row.cost_price}→{row.exit_price} ({row.pnl_pct}%)"
+    )
+
+
+@app.command("review")
+def review_cmd(
+    output: str | None = typer.Option(
+        None, "--output", "-o", help="Markdown 输出路径；默认 notes/market/日期-ashare.md"
+    ),
+    fundamentals: bool = typer.Option(
+        False,
+        "--fundamentals",
+        "-f",
+        help="扫描持仓 F0/F1（较慢，默认关）",
+    ),
+    no_print: bool = typer.Option(False, "--no-print", help="不打印正文，只写文件"),
+):
+    """每日复盘：指数/情绪/板块资金/热点 + 持仓结构 + 纪律提示。"""
+    from tools.review import write_daily_review
+
+    console.print("[dim]正在拉取市场与持仓数据…[/dim]")
+    try:
+        path, data = write_daily_review(
+            path=output,
+            include_fundamentals_scan=fundamentals,
+        )
+    except Exception as e:
+        console.print(f"[red]复盘失败：{e}[/red]")
+        raise typer.Exit(1) from e
+
+    miss = data.get("missing") or []
+    if miss:
+        console.print(f"[yellow]部分数据缺失：{', '.join(miss[:6])}[/yellow]")
+    console.print(f"[green]✓ 复盘已写入[/green]  {path}")
+    if not no_print:
+        console.print(Markdown(path.read_text(encoding="utf-8")))
 
 
 @app.command("signals")

@@ -102,13 +102,48 @@ def add_position(code: str, shares: int, cost_price: float, path: Path | str | N
     save_positions(positions, path)
 
 
-def remove_position(code: str, path: Path | str | None = None) -> bool:
-    """删除持仓，返回是否删除成功。"""
+def remove_position(
+    code: str,
+    path: Path | str | None = None,
+    *,
+    record_closed: bool = False,
+    exit_price: float | None = None,
+    note: str = "",
+) -> bool:
+    """删除持仓，返回是否删除成功。
+
+    record_closed=True 时写入 closed.toml（需 exit_price）。
+    """
     code = normalize_code(code)
     positions = load_positions(path)
-    before = len(positions)
-    positions = [p for p in positions if p.code != code]
-    if len(positions) < before:
-        save_positions(positions, path)
-        return True
-    return False
+    removed: Position | None = None
+    kept: list[Position] = []
+    for p in positions:
+        if p.code == code:
+            removed = p
+        else:
+            kept.append(p)
+    if removed is None:
+        return False
+    save_positions(kept, path)
+    if record_closed and exit_price is not None:
+        try:
+            from closed_ledger import add_closed
+            from data.source import get_quote
+
+            name = ""
+            try:
+                name = (get_quote(code) or {}).get("name") or ""
+            except Exception:
+                pass
+            add_closed(
+                code,
+                removed.shares,
+                removed.cost_price,
+                float(exit_price),
+                name=name,
+                note=note,
+            )
+        except Exception:
+            pass
+    return True

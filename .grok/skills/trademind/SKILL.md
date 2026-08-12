@@ -134,6 +134,20 @@ uv run trademind report -o /tmp/holdings.html
 
 默认写入 `notes/reports/portfolio_时间戳.html`。
 
+### 1d. 每日复盘 / 买入管道 / 辩论 / 扫描
+
+```bash
+cd /Users/neal/project/TradeMind
+uv run trademind review
+uv run trademind buy <CODE>          # 新开仓评估管道
+uv run trademind debate <CODE>       # 多空 + decide 收尾
+uv run trademind scan-strong         # 强势池 ∩ 纪律
+uv run trademind watch add 600519
+uv run trademind closed list
+```
+
+写入 `notes/market/`；Agent 优先：`buy_pipeline` / `daily_review` / `debate_code` / `scan_strong_stocks`。
+
 ### 2–4. 行情 / K 线 / 指标
 
 见上文管道命令；亦可单独：

@@ -97,13 +97,19 @@ def build_portfolio_html(
     *,
     title: str = "TradeMind 持仓分析",
     generated_at: datetime | None = None,
+    market: dict | None = None,
+    discipline: dict | None = None,
 ) -> str:
     """组装完整 HTML 字符串。"""
     now = generated_at or datetime.now()
     positions = overview.get("positions") or []
     pnl_rows = pnl.get("positions") or []
     industries = risk.get("industry_distribution") or []
-    warnings = risk.get("warnings") or []
+    warnings = list(risk.get("warnings") or [])
+    # 纪律提示并入风险区
+    for w in (discipline or {}).get("warnings") or []:
+        if w and w not in warnings:
+            warnings.append(w)
 
     # 合并 overview + pnl 便于一张表
     pnl_map = {p.get("code"): p for p in pnl_rows}
@@ -165,8 +171,60 @@ def build_portfolio_html(
     total_cost = pnl.get("total_cost")
     total_pnl = pnl.get("total_pnl")
     total_pnl_pct = pnl.get("total_pnl_pct")
-    hhi = risk.get("hhi")
     pos_count = overview.get("count") or len(positions)
+    # 现金 / 总资产 / 仓位占比（市值÷总资产）
+    cash = overview.get("cash")
+    if cash is None:
+        cash = risk.get("cash")
+    total_assets = overview.get("total_assets")
+    if total_assets is None:
+        total_assets = risk.get("total_assets")
+    if total_assets is None and total_mv is not None:
+        try:
+            cash_f = float(cash) if cash is not None else 0.0
+            total_assets = float(total_mv) + cash_f
+        except (TypeError, ValueError):
+            total_assets = total_mv
+    position_ratio = overview.get("position_ratio")
+    if position_ratio is None and total_assets and total_mv is not None:
+        try:
+            ta = float(total_assets)
+            position_ratio = round(float(total_mv) / ta * 100, 2) if ta else None
+        except (TypeError, ValueError):
+            position_ratio = None
+    cash_pct = overview.get("cash_pct")
+    if cash_pct is None and cash is not None and total_assets:
+        try:
+            ta = float(total_assets)
+            cash_pct = round(float(cash) / ta * 100, 2) if ta else None
+        except (TypeError, ValueError):
+            cash_pct = None
+
+    # 今日盈亏合计（优先 overview 字段；否则从明细汇总）
+    total_day_pnl = overview.get("total_day_pnl")
+    total_day_pnl_pct = overview.get("total_day_pnl_pct")
+    if total_day_pnl is None:
+        s = 0.0
+        known = True
+        for r in rows_merged:
+            dp = r.get("day_pnl")
+            if dp is None:
+                known = False
+                break
+            try:
+                s += float(dp)
+            except (TypeError, ValueError):
+                known = False
+                break
+        if known and rows_merged:
+            total_day_pnl = round(s, 2)
+            try:
+                mv_f = float(total_mv or 0)
+                prev_mv = mv_f - total_day_pnl
+                if prev_mv:
+                    total_day_pnl_pct = round(total_day_pnl / prev_mv * 100, 2)
+            except (TypeError, ValueError):
+                total_day_pnl_pct = None
 
     # 今日涨 / 平 / 跌 只数
     n_up = n_flat = n_down = 0
@@ -287,6 +345,52 @@ def build_portfolio_html(
     warn_html = "".join(f"<li>{_e(w)}</li>" for w in warnings) or "<li class='muted'>无额外告警</li>"
     priority_html = "".join(priority) or "<li class='muted'>无高优先级执行项（多为观望）</li>"
 
+    # 市场层（可选）
+    mkt = market or {}
+    idx_lines = []
+    for i in (mkt.get("indices") or [])[:6]:
+        pct = i.get("pct_change")
+        pct_s = _fmt_pct(pct) if pct is not None else "—"
+        idx_lines.append(
+            f"<li>{_e(i.get('name'))} "
+            f"<span class='{_cls_pnl(pct)}'>{_e(pct_s)}</span></li>"
+        )
+    sent = mkt.get("limit_sentiment") or {}
+    sent_html = "—"
+    if sent:
+        sent_html = (
+            f"涨停 {sent.get('zt_count')} · 炸板 {sent.get('zb_count')} · "
+            f"跌停 {sent.get('dt_count')} · 炸板率 {sent.get('break_rate_pct')}% · "
+            f"最高 {sent.get('max_height')} 连板"
+        )
+    board_lines = []
+    for r in (mkt.get("board_fund") or [])[:8]:
+        board_lines.append(
+            f"<li>{_e(r.get('name'))} "
+            f"{r.get('main_net_yi')}亿 "
+            f"<span class='muted'>{_e(r.get('leader'))}</span></li>"
+        )
+    hot = mkt.get("hot") or {}
+    theme_bits = " · ".join(
+        f"{t.get('tag')}({t.get('count')})" for t in (hot.get("themes") or [])[:8]
+    ) or "—"
+    market_section = ""
+    if mkt:
+        market_section = f"""
+  <div class="section two">
+    <div class="card">
+      <h2>市场 · 指数</h2>
+      <ul class="clean">{"".join(idx_lines) or "<li class='muted'>无指数数据</li>"}</ul>
+      <p class="muted" style="margin:10px 0 0;font-size:0.8rem">情绪：{_e(sent_html)}</p>
+    </div>
+    <div class="card">
+      <h2>市场 · 板块资金 / 题材</h2>
+      <ul class="clean">{"".join(board_lines) or "<li class='muted'>无板块数据</li>"}</ul>
+      <p class="muted" style="margin:10px 0 0;font-size:0.8rem">热点：{_e(theme_bits)}</p>
+    </div>
+  </div>
+"""
+
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -338,13 +442,36 @@ def build_portfolio_html(
   .page-actions a.primary {{
     background: rgba(59,130,246,0.18); border-color: rgba(59,130,246,0.45); color: #93c5fd;
   }}
-  .grid {{ display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-bottom: 20px; }}
+  /* 顶部 KPI：四卡等宽，标签 / 主数 / 副行 */
+  .grid {{
+    display: grid; gap: 12px; margin-bottom: 20px;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }}
+  @media (max-width: 900px) {{
+    .grid {{ grid-template-columns: 1fr 1fr; }}
+  }}
+  @media (max-width: 520px) {{
+    .grid {{ grid-template-columns: 1fr; }}
+  }}
   .card {{
-    background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px 18px; min-height: 108px; min-width: 0;
   }}
   .card .label {{ color: var(--muted); font-size: 0.75rem; letter-spacing: 0.02em; }}
   .card .value {{ font-size: 1.25rem; font-weight: 650; margin-top: 6px; font-variant-numeric: tabular-nums; }}
-  /* 合并指标：两行堆叠，主次分明 */
+  .kpi-main {{
+    margin-top: 10px; font-size: 1.45rem; font-weight: 700; line-height: 1.2;
+    font-variant-numeric: tabular-nums; letter-spacing: -0.02em;
+  }}
+  .kpi-sub {{
+    margin-top: 8px; font-size: 0.8rem; color: var(--muted); line-height: 1.4;
+    font-variant-numeric: tabular-nums;
+  }}
+  .kpi-sub .sep {{ margin: 0 0.35em; opacity: 0.55; }}
+  .kpi-main.up, .kpi-sub.up {{ color: var(--up); }}
+  .kpi-main.down, .kpi-sub.down {{ color: var(--down); }}
+  .kpi-main.flat, .kpi-sub.flat {{ color: var(--muted); }}
+  /* 合并指标（其它区块仍可能用到） */
   .metric-stack {{ margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }}
   .metric-line {{
     display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
@@ -391,20 +518,9 @@ def build_portfolio_html(
   .card .label .hint-unit {{
     margin-left: 6px; font-size: 0.68rem; color: var(--muted); font-weight: 500;
   }}
-  /* 涨平跌 chips */
-  .count-chips {{
-    margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
-  }}
-  .chip {{
-    display: inline-flex; align-items: center; gap: 4px;
-    padding: 3px 9px; border-radius: 999px; font-size: 0.78rem; font-weight: 650;
-    font-variant-numeric: tabular-nums; border: 1px solid transparent;
-  }}
-  .chip .n {{ font-size: 0.95rem; }}
-  .chip-up {{ color: var(--up); background: rgba(246,70,93,0.12); border-color: rgba(246,70,93,0.25); }}
-  .chip-flat {{ color: var(--muted); background: rgba(139,155,180,0.12); border-color: rgba(139,155,180,0.25); }}
-  .chip-down {{ color: var(--down); background: rgba(14,203,129,0.12); border-color: rgba(14,203,129,0.25); }}
-  .chip-total {{ color: #c5d0e0; background: rgba(59,130,246,0.1); border-color: rgba(59,130,246,0.25); }}
+  .kpi-sub .up {{ color: var(--up); }}
+  .kpi-sub .down {{ color: var(--down); }}
+  .kpi-sub .flat {{ color: var(--muted); }}
   .section {{ margin-bottom: 22px; }}
   table {{ width: 100%; border-collapse: separate; border-spacing: 0; font-size: 0.85rem; }}
   th, td {{ padding: 8px 10px; text-align: left; }}
@@ -475,43 +591,28 @@ def build_portfolio_html(
 
   <div class="grid">
     <div class="card">
-      <div class="label">资产概况 <span class="hint-unit">默认万 · 点击金额切换</span></div>
-      <div class="metric-stack">
-        <div class="metric-line">
-          <span class="metric-k">总市值</span>
-          {_money_toggle(total_mv, css=f"metric-v {_cls_pnl(total_pnl)}")}
-        </div>
-        <div class="metric-line">
-          <span class="metric-k">总成本</span>
-          {_money_toggle(total_cost, css="metric-v sm")}
-        </div>
+      <div class="label">总资产 <span class="hint-unit">点击金额切换万/元</span></div>
+      {_money_toggle(total_assets if total_assets is not None else total_mv, css="kpi-main")}
+      <div class="kpi-sub">
+        市值 {_fmt_wan(total_mv)}<span class="sep">·</span>现金 {_fmt_wan(cash) if cash is not None else "—"}<span class="sep">·</span>仓位 {f"{float(position_ratio):.1f}%" if position_ratio is not None else "—"}
       </div>
     </div>
     <div class="card">
-      <div class="label">浮盈亏 <span class="hint-unit">默认万 · 点击金额切换</span></div>
-      <div class="metric-stack">
-        <div class="metric-line">
-          <span class="metric-k">金额</span>
-          {_money_toggle(total_pnl, css=f"metric-v {_cls_pnl(total_pnl)}", signed=True)}
-        </div>
-        <div class="metric-line">
-          <span class="metric-k">比率</span>
-          <span class="metric-v {_cls_pnl(total_pnl_pct)}">{_fmt_pct(total_pnl_pct)}</span>
-        </div>
-      </div>
+      <div class="label">今日盈亏</div>
+      {_money_toggle(total_day_pnl, css=f"kpi-main {_cls_pnl(total_day_pnl)}", signed=True)}
+      <div class="kpi-sub {_cls_pnl(total_day_pnl_pct)}">{_fmt_pct(total_day_pnl_pct)}</div>
     </div>
     <div class="card">
-      <div class="label">持仓只数</div>
-      <div class="count-chips">
-        <span class="chip chip-total">共 <span class="n">{_e(pos_count)}</span></span>
-        <span class="chip chip-up">涨 <span class="n">{n_up}</span></span>
-        <span class="chip chip-flat">平 <span class="n">{n_flat}</span></span>
-        <span class="chip chip-down">跌 <span class="n">{n_down}</span></span>
-      </div>
+      <div class="label">浮盈亏</div>
+      {_money_toggle(total_pnl, css=f"kpi-main {_cls_pnl(total_pnl)}", signed=True)}
+      <div class="kpi-sub {_cls_pnl(total_pnl_pct)}">{_fmt_pct(total_pnl_pct)} · 成本 {_fmt_wan(total_cost)}</div>
     </div>
     <div class="card">
-      <div class="label">行业集中度 HHI</div>
-      <div class="value">{_e(hhi)}</div>
+      <div class="label">持仓</div>
+      <div class="kpi-main">{_e(pos_count)}</div>
+      <div class="kpi-sub">
+        <span class="up">涨 {n_up}</span><span class="sep">·</span><span class="flat">平 {n_flat}</span><span class="sep">·</span><span class="down">跌 {n_down}</span>
+      </div>
     </div>
   </div>
 
@@ -528,7 +629,7 @@ def build_portfolio_html(
             <th class="num sortable" data-col="4" data-type="num">今日%</th>
             <th class="num sortable" data-col="5" data-type="num">今日盈亏</th>
             <th class="num sortable" data-col="6" data-type="num">市值</th>
-            <th class="num sortable sorted" data-col="7" data-type="num">权重<span class="th-arrow">↓</span></th>
+            <th class="num sortable sorted" data-col="7" data-type="num" title="市值÷总资产（含现金）">仓位%<span class="th-arrow">↓</span></th>
             <th class="num sortable" data-col="8" data-type="num">浮盈亏</th>
             <th class="num sortable" data-col="9" data-type="num">盈亏%</th>
           </tr>
@@ -540,8 +641,10 @@ def build_portfolio_html(
     </div>
   </div>
 
+  {market_section}
+
   <div class="section card warn-box">
-    <h2>风险提示</h2>
+    <h2>风险 / 纪律提示</h2>
     <ul class="clean">{warn_html}</ul>
   </div>
 
@@ -557,7 +660,7 @@ def build_portfolio_html(
   </div>
 
   <div class="section card">
-    <h2>行业分布</h2>
+    <h2>行业分布 <span class="muted" style="font-size:0.8rem;font-weight:500">（占位% = 市值÷总资产，含现金）</span></h2>
     {"".join(ind_bars) or "<p class='muted'>无行业数据</p>"}
   </div>
 
@@ -716,8 +819,13 @@ def build_portfolio_html(
 """
 
 
-def collect_report_data(*, include_signals: bool = True, days: int = 90) -> dict:
-    """拉取 overview / pnl / risk / signals。
+def collect_report_data(
+    *,
+    include_signals: bool = True,
+    include_market: bool = True,
+    days: int = 90,
+) -> dict:
+    """拉取 overview / pnl / risk / signals / market。
 
     性能：持仓行情只批量请求 **1 次**，overview/pnl/risk 复用同一份 quotes，
     避免原先三次独立 _load_and_quote。
@@ -733,17 +841,22 @@ def collect_report_data(*, include_signals: bool = True, days: int = 90) -> dict
         portfolio_risk_from,
     )
 
+    from portfolio import load_cash
+
     t0 = time.time()
     positions = load_positions()
+    cash = load_cash()
     codes = [p.code for p in positions]
     quotes = get_quotes(codes) if codes else []
     t_quote = time.time() - t0
 
     out: dict[str, Any] = {
-        "overview": portfolio_overview_from(positions, quotes),
+        "overview": portfolio_overview_from(positions, quotes, cash=cash),
         "pnl": portfolio_pnl_from(positions, quotes),
-        "risk": portfolio_risk_from(positions, quotes),
+        "risk": portfolio_risk_from(positions, quotes, cash=cash),
         "signals": None,
+        "market": None,
+        "discipline": None,
         "_timing": {"quote_s": round(t_quote, 3)},
     }
     if include_signals:
@@ -755,6 +868,18 @@ def collect_report_data(*, include_signals: bool = True, days: int = 90) -> dict
             "data": evaluate_portfolio(days=days, quotes=quotes, positions=positions)
         }
         out["_timing"]["signals_s"] = round(time.time() - t1, 3)
+    if include_market:
+        t2 = time.time()
+        try:
+            from tools.review import collect_daily_review
+
+            rev = collect_daily_review(include_fundamentals_scan=False)
+            out["market"] = rev.get("market")
+            out["discipline"] = rev.get("discipline")
+        except Exception as e:
+            out["market"] = {"error": str(e)}
+            out["discipline"] = {"warnings": [f"市场复盘失败: {e}"]}
+        out["_timing"]["market_s"] = round(time.time() - t2, 3)
     out["_timing"]["total_s"] = round(time.time() - t0, 3)
     return out
 
@@ -763,11 +888,16 @@ def write_portfolio_report(
     path: Path | str | None = None,
     *,
     include_signals: bool = True,
+    include_market: bool = True,
     days: int = 90,
     open_browser: bool = False,
 ) -> Path:
     """生成报告文件，返回路径。"""
-    data = collect_report_data(include_signals=include_signals, days=days)
+    data = collect_report_data(
+        include_signals=include_signals,
+        include_market=include_market,
+        days=days,
+    )
     now = datetime.now()
     html_str = build_portfolio_html(
         data["overview"],
@@ -775,6 +905,8 @@ def write_portfolio_report(
         data["risk"],
         data.get("signals"),
         generated_at=now,
+        market=data.get("market"),
+        discipline=data.get("discipline"),
     )
     reports_dir = Path(__file__).resolve().parent.parent / "notes" / "reports"
     if path is None:
