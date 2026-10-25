@@ -45,6 +45,7 @@ def main(argv: list[str] | None = None) -> int:
         path = write_portfolio_report(
             None,
             include_signals=bool(args.signals),
+            include_market=bool(args.signals),
             days=int(args.days),
             open_browser=False,
         )

@@ -5,6 +5,8 @@ LLM 可通过这些工具对用户的持仓进行行情概览、盈亏分析、�
 
 from __future__ import annotations
 
+from datetime import date
+
 from tools.registry import register
 
 
@@ -50,15 +52,22 @@ def portfolio_overview_from(
         price = q.get("price") or 0
         market_value = price * p.shares
         total_market_value += market_value
-        # 今日盈亏金额 = 涨跌额 × 股数
-        change = q.get("change")
-        if change is None:
-            prev = q.get("prev_close")
-            if prev is not None and price:
-                try:
-                    change = float(price) - float(prev)
-                except (TypeError, ValueError):
-                    change = None
+        # 今日新建仓没有昨日持仓基数，按实际买入成本计算今日盈亏。
+        # 其余持仓仍按当日涨跌额（现价−昨收）计算。
+        opened_today = getattr(p, "opened_on", None) == date.today().isoformat()
+        if opened_today and price:
+            change = float(price) - float(p.cost_price)
+            pct_change = round(change / float(p.cost_price) * 100, 2) if p.cost_price else None
+        else:
+            change = q.get("change")
+            pct_change = q.get("pct_change")
+            if change is None:
+                prev = q.get("prev_close")
+                if prev is not None and price:
+                    try:
+                        change = float(price) - float(prev)
+                    except (TypeError, ValueError):
+                        change = None
         day_pnl = None
         if change is not None:
             try:
@@ -71,7 +80,7 @@ def portfolio_overview_from(
             "shares": p.shares,
             "cost_price": p.cost_price,
             "price": price,
-            "pct_change": q.get("pct_change"),
+            "pct_change": pct_change,
             "change": change,
             "day_pnl": day_pnl,
             "market_value": round(market_value, 2),

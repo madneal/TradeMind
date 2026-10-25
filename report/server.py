@@ -199,6 +199,7 @@ def regenerate(
     path = write_portfolio_report(
         None,
         include_signals=include_signals,
+        include_market=include_signals,
         days=days,
         open_browser=False,
     )
@@ -390,6 +391,12 @@ class ReportHandler(BaseHTTPRequestHandler):
         data = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
         self._send(code, data, "application/json; charset=utf-8")
 
+    def _redirect_home(self) -> None:
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
@@ -419,6 +426,16 @@ class ReportHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"reports": list_history()})
             return
 
+        if path == "/api/refresh":
+            full = qs.get("full", ["0"])[0] in ("1", "true", "yes")
+            try:
+                days = int(qs.get("days", [str(self.days)])[0])
+            except ValueError:
+                days = self.days
+            started = start_regenerate_async(include_signals=full, days=days)
+            self._send_json(202, {"started": started, "running": True, "mode": _regen_status["mode"]})
+            return
+
         if path.startswith("/r/"):
             name = path[3:]
             if not re.fullmatch(r"portfolio_[\w.-]+\.html", name):
@@ -444,15 +461,20 @@ class ReportHandler(BaseHTTPRequestHandler):
                 days = self.days
 
             if _regen_status["running"]:
-                self._send_html(200, _busy_page(full=want_signals))
+                if latest_path().is_file():
+                    self._redirect_home()
+                else:
+                    self._send_html(200, _busy_page(full=want_signals))
                 return
 
             started = start_regenerate_async(include_signals=want_signals, days=days)
             if not started:
                 self._send_html(200, _busy_page(full=want_signals))
                 return
-            # 立即返回，不阻塞 HTTP
-            self._send_html(200, _busy_page(full=want_signals))
+            if latest_path().is_file():
+                self._redirect_home()
+            else:
+                self._send_html(200, _busy_page(full=want_signals))
             return
 
         if path == "/":
@@ -463,7 +485,10 @@ class ReportHandler(BaseHTTPRequestHandler):
                 full = qs.get("full", ["0"])[0] in ("1", "true", "yes")
                 if not _regen_status["running"]:
                     start_regenerate_async(include_signals=full, days=self.days)
-                self._send_html(200, _busy_page(full=full))
+                if lp.is_file():
+                    self._redirect_home()
+                else:
+                    self._send_html(200, _busy_page(full=full))
                 return
 
             if not lp.is_file():
@@ -496,17 +521,9 @@ def run_server(
     ReportHandler.include_signals = include_signals
     ReportHandler.days = days
 
-    if generate_on_start:
-        # 启动时用快速生成，避免卡很久；需要策略可点「完整生成」
-        print("[report-server] 启动时快速生成报告（不含策略）…")
-        try:
-            t0 = time.time()
-            path = regenerate(include_signals=False, days=days)
-            print(f"[report-server] 已生成 ({time.time() - t0:.1f}s): {path}")
-        except Exception as e:
-            print(f"[report-server] 启动生成失败（仍会提供已有缓存）: {e}")
-
     httpd = ThreadingHTTPServer((host, port), ReportHandler)
+    if generate_on_start:
+        start_regenerate_async(include_signals=False, days=days)
     url = f"http://{host}:{port}/"
     print(f"[report-server] 持仓报告服务已启动: {url}")
     print("[report-server] / 最新 | /refresh 快速重生成 | /refresh?full=1 含策略 | /history | /health")

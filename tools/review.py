@@ -10,7 +10,9 @@ from pathlib import Path
 from typing import Any
 
 
-def collect_daily_review(*, include_fundamentals_scan: bool = False) -> dict[str, Any]:
+def collect_daily_review(
+    *, include_fundamentals_scan: bool = False, positions=None, quotes=None, cash=None
+) -> dict[str, Any]:
     """组装复盘数据包（尽量容错，单项失败写入 missing）。"""
     from portfolio import load_cash, load_positions
     from data.source import get_quotes
@@ -70,15 +72,15 @@ def collect_daily_review(*, include_fundamentals_scan: bool = False) -> dict[str
         }
 
     # ── 持仓 ──
-    positions = load_positions()
-    cash = load_cash()
+    positions = positions if positions is not None else load_positions()
+    cash = cash if cash is not None else load_cash()
     if not positions:
         out["portfolio"] = {"message": "持仓为空"}
         out["discipline"] = {"warnings": ["持仓为空"]}
         return out
 
     codes = [p.code for p in positions]
-    quotes = get_quotes(codes)
+    quotes = quotes if quotes is not None else get_quotes(codes)
     overview = portfolio_overview_from(positions, quotes, cash=cash)
     pnl = portfolio_pnl_from(positions, quotes)
 

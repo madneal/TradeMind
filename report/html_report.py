@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import html
+import json
+import math
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -89,6 +92,402 @@ def _action_cls(action: str) -> str:
     return "act-hold"
 
 
+_REPORT_NAME_RE = re.compile(r"^portfolio_(\d{8})_(\d{6})\.html$")
+_DATA_RAW_RE = re.compile(r'data-raw="([+-]?\d+(?:\.\d+)?)"')
+_PCT_RE = re.compile(r"([+-]?\d+(?:\.\d+)?)%")
+# 两次快照间隔超过该天数时，连线改虚线，避免把空档看成逐日走势。
+_CUM_GAP_DASH_DAYS = 5
+
+
+def _reports_dir() -> Path:
+    return Path(__file__).resolve().parent.parent / "notes" / "reports"
+
+
+def _extract_cumulative_point(html_text: str) -> tuple[float, float | None] | None:
+    """从报告正文取出「累计收益」金额（元）和紧随的百分比。"""
+    idx = html_text.find("累计收益")
+    if idx < 0:
+        return None
+    window = html_text[idx : idx + 800]
+    raw = _DATA_RAW_RE.search(window)
+    if not raw:
+        return None
+    pct_m = _PCT_RE.search(window)
+    pct = float(pct_m.group(1)) if pct_m else None
+    return float(raw.group(1)), pct
+
+
+def load_cumulative_pnl_series(reports_dir: Path | None = None) -> list[dict]:
+    """每个自然日取最后一份带「累计收益」的报告。
+
+    返回按日期升序的 `{date, pnl, pct, source}`。pnl 为元。
+    """
+    reports_dir = reports_dir or _reports_dir()
+    if not reports_dir.is_dir():
+        return []
+    by_day: dict[str, dict] = {}
+    for path in sorted(reports_dir.glob("portfolio_*.html")):
+        matched = _REPORT_NAME_RE.match(path.name)
+        if not matched:
+            continue
+        day = matched.group(1)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        extracted = _extract_cumulative_point(text)
+        if extracted is None:
+            continue
+        pnl, pct = extracted
+        iso = f"{day[:4]}-{day[4:6]}-{day[6:8]}"
+        by_day[iso] = {
+            "date": iso,
+            "pnl": pnl,
+            "pct": pct,
+            "source": path.name,
+        }
+    return [by_day[key] for key in sorted(by_day)]
+
+
+def load_daily_pnl_series(reports_dir: Path | None = None) -> list[dict]:
+    """每个交易日取 15:00 后最后一份报告的「今日盈亏」。"""
+    reports_dir = reports_dir or _reports_dir()
+    if not reports_dir.is_dir():
+        return []
+    by_day: dict[str, dict] = {}
+    for path in sorted(reports_dir.glob("portfolio_*.html")):
+        matched = _REPORT_NAME_RE.match(path.name)
+        if not matched or matched.group(2) < "150000":
+            continue
+        day = matched.group(1)
+        iso = f"{day[:4]}-{day[4:6]}-{day[6:8]}"
+        if _ymd(iso).weekday() >= 5:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        idx = text.find('class="summary-label">今日盈亏')
+        if idx < 0:
+            continue
+        window = text[idx : idx + 800]
+        raw = _DATA_RAW_RE.search(window)
+        if raw is None:
+            continue
+        pct_match = _PCT_RE.search(window)
+        by_day[iso] = {
+            "date": iso,
+            "pnl": float(raw.group(1)),
+            "pct": float(pct_match.group(1)) if pct_match else None,
+            "source": path.name,
+        }
+    return [by_day[key] for key in sorted(by_day)]
+
+
+def _series_with_point(
+    series: list[dict], day: str, pnl: float | None, pct: float | None = None
+) -> list[dict]:
+    """用本次生成的累计收益覆盖当天快照，保证图和页头数字一致。"""
+    if pnl is None:
+        return series
+    kept = [row for row in series if row.get("date") != day]
+    kept.append({"date": day, "pnl": float(pnl), "pct": pct, "source": "current"})
+    kept.sort(key=lambda row: row["date"])
+    return kept
+
+
+def _nice_step(span: float, target: int = 4) -> float:
+    if span <= 0:
+        return 1.0
+    raw = span / max(target, 1)
+    mag = 10 ** math.floor(math.log10(raw))
+    for factor in (1, 2, 2.5, 5, 10):
+        step = factor * mag
+        if step >= raw * 0.75:
+            return step
+    return 10 * mag
+
+
+def _axis_ticks(lo: float, hi: float) -> list[float]:
+    step = _nice_step(hi - lo)
+    start = math.floor(lo / step) * step
+    ticks: list[float] = []
+    value = start
+    # 浮点步进可能多走一格，用次数上限卡住。
+    for _ in range(12):
+        if value > hi + step * 0.01:
+            break
+        if value >= lo - step * 0.01:
+            ticks.append(value)
+        value += step
+    if lo < 0 < hi and not any(abs(tick) <= step * 0.05 for tick in ticks):
+        ticks.append(0.0)
+        ticks.sort()
+    return ticks
+
+
+def _fmt_axis_wan(value: float) -> str:
+    wan = value / 10000.0
+    if abs(wan) < 0.05:
+        return "0"
+    if abs(wan - round(wan)) < 0.05:
+        return f"{wan:+.0f}万"
+    return f"{wan:+.1f}万"
+
+
+def _ymd(iso: str) -> datetime:
+    return datetime.strptime(iso, "%Y-%m-%d")
+
+
+def _show_xlabel(index: int, count: int, max_i: int, min_i: int) -> bool:
+    if count <= 8 or index in (0, count - 1, max_i, min_i):
+        return True
+    step = max(1, round((count - 1) / 5))
+    return index % step == 0
+
+
+def _chart_aria(series: list[dict], max_i: int, min_i: int, label: str = "累计收益") -> str:
+    high = series[max_i]
+    low = series[min_i]
+    if max_i == min_i:
+        return f"{label}，仅 {high['date']} {_fmt_wan(high['pnl'], signed=True)}"
+    return (
+        f"{label}折线，最高 {high['date']} {_fmt_wan(high['pnl'], signed=True)}，"
+        f"最低 {low['date']} {_fmt_wan(low['pnl'], signed=True)}"
+    )
+
+
+def _pill_text(series: list[dict], index: int, max_i: int, min_i: int) -> str:
+    amount = _fmt_wan(series[index]["pnl"], signed=True)
+    if max_i == min_i:
+        return f"最高/最低 {amount}"
+    tag = "最高" if index == max_i else "最低"
+    return f"{tag} {amount}"
+
+
+def _fmt_pct_plain(value: float | None) -> str:
+    if value is None:
+        return ""
+    return f" ({value:+.2f}%)"
+
+
+def _cumulative_chart_svg(series: list[dict], label: str = "累计收益") -> str:
+    """折线用 SVG，刻度和最高/最低标签用 HTML，字号不随图宽缩放。"""
+    n = len(series)
+    values = [float(row["pnl"]) for row in series]
+    data_lo = min(values)
+    data_hi = max(values)
+    span = data_hi - data_lo
+    pad = span * 0.28 if span else max(abs(data_lo) * 0.2, 1000.0)
+    view_lo = data_lo - pad
+    view_hi = data_hi + pad
+    if view_hi <= view_lo:
+        view_hi = view_lo + 1.0
+    max_i = max(range(n), key=lambda i: values[i])
+    min_i = min(range(n), key=lambda i: values[i])
+
+    def x_pct(index: int) -> float:
+        if n == 1:
+            return 50.0
+        return 100.0 * index / (n - 1)
+
+    def y_pct(value: float) -> float:
+        return (view_hi - value) / (view_hi - view_lo) * 100.0
+
+    def sx(index: int) -> float:
+        return x_pct(index) * 10.0
+
+    def sy(value: float) -> float:
+        return y_pct(value) * 10.0
+
+    y_zero = sy(0.0)
+    zero_visible = 0.0 <= y_zero <= 1000.0
+    svg_parts = [
+        '<svg viewBox="0 0 1000 1000" preserveAspectRatio="none" aria-hidden="true">'
+    ]
+    for tick in _axis_ticks(view_lo, view_hi):
+        y = sy(tick)
+        if y < -1 or y > 1001:
+            continue
+        is_zero = abs(tick) < 1
+        stroke = "#8b9bb4" if is_zero else "#2d3a4d"
+        dash = ' stroke-dasharray="8 8"' if is_zero else ""
+        svg_parts.append(
+            f'<line x1="0" y1="{y:.1f}" x2="1000" y2="{y:.1f}" '
+            f'stroke="{stroke}" stroke-width="1" vector-effect="non-scaling-stroke"{dash}/>'
+        )
+    for i in range(n - 1):
+        gap_days = (_ymd(series[i + 1]["date"]) - _ymd(series[i]["date"])).days
+        dashed = gap_days > _CUM_GAP_DASH_DAYS
+        x0, y0 = sx(i), sy(values[i])
+        x1, y1 = sx(i + 1), sy(values[i + 1])
+        if zero_visible and not dashed:
+            svg_parts.append(
+                f'<polygon points="{x0:.1f},{y0:.1f} {x1:.1f},{y1:.1f} '
+                f'{x1:.1f},{y_zero:.1f} {x0:.1f},{y_zero:.1f}" fill="rgba(96,165,250,0.16)"/>'
+            )
+        dash = ' stroke-dasharray="7 6"' if dashed else ""
+        svg_parts.append(
+            f'<line x1="{x0:.1f}" y1="{y0:.1f}" x2="{x1:.1f}" y2="{y1:.1f}" '
+            f'stroke="#60a5fa" stroke-width="2.25" vector-effect="non-scaling-stroke" '
+            f'stroke-linecap="round"{dash}/>'
+        )
+    svg_parts.append("</svg>")
+
+    y_labels: list[str] = []
+    for tick in _axis_ticks(view_lo, view_hi):
+        yp = y_pct(tick)
+        if yp < -2 or yp > 102:
+            continue
+        y_labels.append(
+            f'<span style="top:{min(max(yp, 1), 99):.2f}%">{_e(_fmt_axis_wan(tick))}</span>'
+        )
+
+    dots: list[str] = []
+    xlabels: list[str] = []
+    for i, row in enumerate(series):
+        xp, yp = x_pct(i), y_pct(values[i])
+        amount = _fmt_wan(row["pnl"], signed=True)
+        if i == max_i and i == min_i:
+            kind = "flat"
+        elif i == max_i:
+            kind = "up"
+        elif i == min_i:
+            kind = "down"
+        else:
+            kind = ""
+        dot_cls = "cum-dot" + (f" {kind}" if kind else "")
+        dots.append(
+            f'<span class="{dot_cls}" style="left:{xp:.2f}%;top:{yp:.2f}%" '
+            f'title="{_e(row["date"] + " " + amount)}"></span>'
+        )
+        if not _show_xlabel(i, n, max_i, min_i):
+            continue
+        edge = " start" if i == 0 else " end" if i == n - 1 else ""
+        xlabels.append(
+            f'<span class="cum-xlabel{edge}{(" " + kind) if kind else ""}" '
+            f'style="left:{xp:.2f}%">{_e(row["date"][5:])}</span>'
+        )
+
+    def pill(index: int, below: bool) -> str:
+        xp = x_pct(index)
+        kind = "flat" if max_i == min_i else "up" if index == max_i else "down"
+        if xp < 18:
+            tx = "0"
+        elif xp > 82:
+            tx = "-100%"
+        else:
+            tx = "-50%"
+        ty = "12px" if below else "calc(-100% - 12px)"
+        return (
+            f'<span class="cum-pill {kind}" '
+            f'style="left:{xp:.2f}%;top:{y_pct(values[index]):.2f}%;'
+            f'transform:translate({tx},{ty})">{_e(_pill_text(series, index, max_i, min_i))}</span>'
+        )
+
+    pills = [pill(max_i, False)]
+    if min_i != max_i:
+        pills.append(pill(min_i, True))
+
+    return (
+        f'<div class="cum-plot" role="img" aria-label="{_e(_chart_aria(series, max_i, min_i, label))}">'
+        f'<div class="cum-y">{"".join(y_labels)}</div>'
+        f'<div class="cum-area">{"".join(svg_parts)}{"".join(dots)}{"".join(pills)}{"".join(xlabels)}</div>'
+        f"</div>"
+    )
+
+
+def _cumulative_chart_section(series: list[dict], *, daily: bool = False) -> str:
+    if not series:
+        return '<div class="section card"><h2>单日盈亏曲线</h2><p class="muted">暂无收盘后的报告数据。</p></div>' if daily else ""
+    values = [float(row["pnl"]) for row in series]
+    max_i = max(range(len(series)), key=lambda i: values[i])
+    min_i = min(range(len(series)), key=lambda i: values[i])
+    high = series[max_i]
+    low = series[min_i]
+    has_gap = any(
+        (_ymd(series[i + 1]["date"]) - _ymd(series[i]["date"])).days > _CUM_GAP_DASH_DAYS
+        for i in range(len(series) - 1)
+    )
+    gap_note = " 虚线表示两次报告间隔超过 5 天，中间没有逐日数据。" if has_gap else ""
+    if max_i == min_i:
+        extreme_html = (
+            f'<span><span class="k">最高/最低</span>{_e(high["date"])} '
+            f'{_e(_fmt_wan(high["pnl"], signed=True))}{_e(_fmt_pct_plain(high.get("pct")))}</span>'
+        )
+    else:
+        extreme_html = (
+            f'<span class="up"><span class="k">最高</span>{_e(high["date"])} '
+            f'{_e(_fmt_wan(high["pnl"], signed=True))}{_e(_fmt_pct_plain(high.get("pct")))}</span>'
+            f'<span class="down"><span class="k">最低</span>{_e(low["date"])} '
+            f'{_e(_fmt_wan(low["pnl"], signed=True))}{_e(_fmt_pct_plain(low.get("pct")))}</span>'
+        )
+    svg = _cumulative_chart_svg(series, "单日盈亏" if daily else "累计收益")
+    chart_id = "daily-pnl-chart" if daily else "cumulative-chart"
+    chart_title = "单日盈亏曲线" if daily else "累计收益曲线"
+    chart_note = (
+        "口径与上方「今日盈亏」相同。每个交易日取 15:00 后最后一份报告；没有收盘后报告的日期不补值。"
+        if daily else "口径与上方「累计收益」相同（总资产 − 入金成本）。每个日期取当日最后一份报告。"
+    )
+    return f"""
+  <style>
+    #{chart_id}.card {{ min-height: 0; }}
+    .cum-chart {{ margin-top: 2px; }}
+    .cum-plot {{
+      display: grid; grid-template-columns: 46px minmax(0, 1fr);
+      column-gap: 6px; align-items: start;
+    }}
+    .cum-y {{ position: relative; height: 260px; }}
+    .cum-y span {{
+      position: absolute; right: 0; transform: translateY(-50%);
+      color: var(--muted); font-size: 11px; line-height: 1;
+      font-variant-numeric: tabular-nums; white-space: nowrap;
+    }}
+    .cum-area {{ position: relative; height: 260px; margin: 0 0 22px; }}
+    .cum-area svg {{ position: absolute; inset: 0; width: 100%; height: 100%; display: block; }}
+    .cum-dot {{
+      position: absolute; width: 8px; height: 8px; box-sizing: border-box;
+      border-radius: 50%; background: #0f1419; border: 2px solid #60a5fa;
+      transform: translate(-50%, -50%);
+    }}
+    .cum-dot.up, .cum-dot.down, .cum-dot.flat {{ width: 11px; height: 11px; border: none; }}
+    .cum-dot.up {{ background: #f6465d; box-shadow: 0 0 0 4px rgba(246,70,93,0.28); }}
+    .cum-dot.down {{ background: #0ecb81; box-shadow: 0 0 0 4px rgba(14,203,129,0.28); }}
+    .cum-dot.flat {{ background: #93c5fd; box-shadow: 0 0 0 4px rgba(147,197,253,0.28); }}
+    .cum-pill {{
+      position: absolute; z-index: 1; white-space: nowrap; pointer-events: none;
+      padding: 2px 8px; border-radius: 6px; font-size: 12px; font-weight: 650; line-height: 1.35;
+      background: #141c28; border: 1px solid currentColor;
+      font-variant-numeric: tabular-nums;
+    }}
+    .cum-pill.up {{ color: var(--up); }}
+    .cum-pill.down {{ color: var(--down); }}
+    .cum-pill.flat {{ color: #93c5fd; }}
+    .cum-xlabel {{
+      position: absolute; top: calc(100% + 6px); font-size: 11px; line-height: 1;
+      color: var(--muted); transform: translateX(-50%); white-space: nowrap;
+    }}
+    .cum-xlabel.start {{ transform: none; }}
+    .cum-xlabel.end {{ transform: translateX(-100%); }}
+    .cum-xlabel.up {{ color: var(--up); font-weight: 650; }}
+    .cum-xlabel.down {{ color: var(--down); font-weight: 650; }}
+    .cum-xlabel.flat {{ color: #93c5fd; font-weight: 650; }}
+    .cum-extremes {{
+      display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 4px;
+      font-size: 0.88rem; font-variant-numeric: tabular-nums;
+    }}
+    .cum-extremes .k {{ color: var(--muted); font-size: 0.75rem; margin-right: 6px; }}
+    .cum-note {{ margin: 8px 0 0; font-size: 0.75rem; line-height: 1.45; }}
+  </style>
+  <div class="section card" id="{chart_id}">
+    <h2>{chart_title}</h2>
+    <div class="cum-chart">{svg}</div>
+    <div class="cum-extremes">{extreme_html}</div>
+    <p class="muted cum-note">{chart_note}{gap_note}</p>
+  </div>
+"""
+
+
 def build_portfolio_html(
     overview: dict,
     pnl: dict,
@@ -99,6 +498,7 @@ def build_portfolio_html(
     generated_at: datetime | None = None,
     market: dict | None = None,
     discipline: dict | None = None,
+    total_deposits: float | None = None,
 ) -> str:
     """组装完整 HTML 字符串。"""
     now = generated_at or datetime.now()
@@ -168,7 +568,6 @@ def build_portfolio_html(
         sig_list = signals
 
     total_mv = overview.get("total_market_value") or pnl.get("total_market_value")
-    total_cost = pnl.get("total_cost")
     total_pnl = pnl.get("total_pnl")
     total_pnl_pct = pnl.get("total_pnl_pct")
     pos_count = overview.get("count") or len(positions)
@@ -185,6 +584,18 @@ def build_portfolio_html(
             total_assets = float(total_mv) + cash_f
         except (TypeError, ValueError):
             total_assets = total_mv
+    cumulative_pnl = None
+    cumulative_pnl_pct = None
+    if total_assets is not None and total_deposits is not None:
+        try:
+            deposits_f = float(total_deposits)
+            cumulative_pnl = float(total_assets) - deposits_f
+            cumulative_pnl_pct = (
+                cumulative_pnl / deposits_f * 100 if deposits_f else None
+            )
+        except (TypeError, ValueError):
+            cumulative_pnl = None
+            cumulative_pnl_pct = None
     position_ratio = overview.get("position_ratio")
     if position_ratio is None and total_assets and total_mv is not None:
         try:
@@ -267,11 +678,41 @@ def build_portfolio_html(
         except (TypeError, ValueError):
             return ""
 
+    def _disp_name(row: dict) -> str:
+        """页面只展示名称，无代码时用代码兜底。"""
+        return str(row.get("name") or row.get("code") or "—")
+
+    def _xueqiu_symbol(code: Any) -> str:
+        """6 位 A 股/场内基金代码转雪球市场代码。"""
+        code_s = str(code or "").strip()
+        if len(code_s) != 6 or not code_s.isdigit():
+            return ""
+        if code_s.startswith(("60", "68", "90", "51", "56", "58", "50", "52", "11")):
+            return f"SH{code_s}"
+        if code_s.startswith(("00", "30", "20", "15", "16", "17", "18", "12")):
+            return f"SZ{code_s}"
+        if code_s.startswith(("43", "83", "87", "92")):
+            return f"BJ{code_s}"
+        return f"SH{code_s}" if code_s[0] in ("5", "6", "9") else f"SZ{code_s}"
+
+    def _stock_link(row: dict) -> str:
+        """生成雪球详情页链接；代码无效时退化为纯文本。"""
+        name = _disp_name(row)
+        symbol = _xueqiu_symbol(row.get("code"))
+        if not symbol:
+            return _e(name)
+        url = f"https://xueqiu.com/S/{symbol}"
+        return (
+            f'<a class="stock-link" href="{_e(url)}" target="_blank" '
+            f'rel="noopener noreferrer" title="在雪球查看 {_e(name)}（{_e(symbol)}）">'
+            f'<span>{_e(name)}</span><span class="stock-link-arrow" aria-hidden="true">↗</span></a>'
+        )
+
     pos_trs = []
     for r in rows_merged:
         pos_trs.append(
             f"""<tr>
-              <td data-v="{_e(r.get("name"))}">{_e(r.get("name"))}</td>
+              <td data-v="{_e(r.get("name"))}">{_stock_link(r)}</td>
               <td class="num" data-v="{_dv(r.get("shares"))}">{_e(r.get("shares"))}</td>
               <td class="num" data-v="{_dv(r.get("cost_price"))}">{_fmt_money(r.get("cost_price"), 3)}</td>
               <td class="num" data-v="{_dv(r.get("price"))}">{_fmt_money(r.get("price"), 3)}</td>
@@ -284,15 +725,11 @@ def build_portfolio_html(
             </tr>"""
         )
 
-    def _disp_name(row: dict) -> str:
-        """页面只展示名称，无代码时用代码兜底。"""
-        return str(row.get("name") or row.get("code") or "—")
-
     drag_trs = []
     for r in drags:
         drag_trs.append(
             f"""<tr>
-              <td>{_e(_disp_name(r))}</td>
+              <td>{_stock_link(r)}</td>
               <td class="num {_cls_pnl(r.get("pnl"))}">{_fmt_money(r.get("pnl"))}</td>
               <td class="num {_cls_pnl(r.get("pnl_pct"))}">{_fmt_pct(r.get("pnl_pct"))}</td>
               <td class="num {_cls_pnl(r.get("pct_change"))}">{_fmt_pct(r.get("pct_change"))}</td>
@@ -300,12 +737,12 @@ def build_portfolio_html(
         )
 
     mover_down = "".join(
-        f"<li>{_e(_disp_name(r))} "
+        f"<li>{_stock_link(r)} "
         f"<span class='{_cls_pnl(r.get('pct_change'))}'>{_fmt_pct(r.get('pct_change'))}</span></li>"
         for r in movers[:5]
     )
     mover_up = "".join(
-        f"<li>{_e(_disp_name(r))} "
+        f"<li>{_stock_link(r)} "
         f"<span class='{_cls_pnl(r.get('pct_change'))}'>{_fmt_pct(r.get('pct_change'))}</span></li>"
         for r in reversed(movers[-5:])
     )
@@ -326,7 +763,7 @@ def build_portfolio_html(
         reason_s = "；".join(str(x) for x in reasons[:2]) if reasons else "—"
         sig_trs.append(
             f"""<tr>
-              <td>{_e(_disp_name(d))}</td>
+              <td>{_stock_link(d)}</td>
               <td class="num">{_fmt_money(d.get("price"), 3)}</td>
               <td><span class="badge {_action_cls(str(action))}">{_e(action)}</span></td>
               <td class="num">{_e(shares if shares not in (None, 0) else "—")}</td>
@@ -337,16 +774,33 @@ def build_portfolio_html(
         )
         if str(action) in ("卖出", "减仓", "买入", "加仓") and shares:
             priority.append(
-                f"<li><strong>{_e(_disp_name(d))}</strong> "
+                f"<li><strong>{_stock_link(d)}</strong> "
                 f"<span class='badge {_action_cls(str(action))}'>{_e(action)}</span> "
                 f"{_e(shares)} 股 · {_e(price_hint)}</li>"
             )
 
-    warn_html = "".join(f"<li>{_e(w)}</li>" for w in warnings) or "<li class='muted'>无额外告警</li>"
+    warning_names = {
+        str(r.get("code") or "").strip(): _disp_name(r)
+        for r in rows_merged
+        if r.get("code") and _disp_name(r) != str(r.get("code"))
+    }
+
+    def _warning_display(warning: Any) -> str:
+        """风险提示只展示证券名称；规则计算仍使用证券代码。"""
+        text = str(warning)
+        for code, name in warning_names.items():
+            text = text.replace(f"{code} {name}", name).replace(code, name)
+        return text
+
+    warn_html = (
+        "".join(f"<li>{_e(_warning_display(w))}</li>" for w in warnings)
+        or "<li class='muted'>无额外告警</li>"
+    )
     priority_html = "".join(priority) or "<li class='muted'>无高优先级执行项（多为观望）</li>"
 
     # 市场层（可选）
     mkt = market or {}
+    market_time = mkt.get("_as_of")
     idx_lines = []
     for i in (mkt.get("indices") or [])[:6]:
         pct = i.get("pct_change")
@@ -380,6 +834,7 @@ def build_portfolio_html(
   <div class="section two">
     <div class="card">
       <h2>市场 · 指数</h2>
+      <p class="muted">市场数据时间：{_e(market_time or '未知')}</p>
       <ul class="clean">{"".join(idx_lines) or "<li class='muted'>无指数数据</li>"}</ul>
       <p class="muted" style="margin:10px 0 0;font-size:0.8rem">情绪：{_e(sent_html)}</p>
     </div>
@@ -390,6 +845,21 @@ def build_portfolio_html(
     </div>
   </div>
 """
+
+    chart_section = _cumulative_chart_section(
+        _series_with_point(
+            load_cumulative_pnl_series(),
+            now.strftime("%Y-%m-%d"),
+            cumulative_pnl,
+            cumulative_pnl_pct,
+        )
+    )
+    daily_series = load_daily_pnl_series()
+    if now.weekday() < 5 and now.strftime("%H%M%S") >= "150000":
+        daily_series = _series_with_point(
+            daily_series, now.strftime("%Y-%m-%d"), total_day_pnl, total_day_pnl_pct
+        )
+    daily_chart_section = _cumulative_chart_section(daily_series, daily=True)
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -416,7 +886,7 @@ def build_portfolio_html(
       "Microsoft YaHei", sans-serif;
     background: var(--bg); color: var(--text); line-height: 1.5;
   }}
-  .wrap {{ max-width: 1100px; margin: 0 auto; }}
+  .wrap {{ max-width: 1360px; margin: 0 auto; }}
   h1 {{ font-size: 1.5rem; margin: 0; font-weight: 650; }}
   h2 {{ font-size: 1.05rem; margin: 0 0 12px; color: #c5d0e0; font-weight: 600; }}
   .sub {{ color: var(--muted); font-size: 0.875rem; margin-bottom: 20px; }}
@@ -442,35 +912,72 @@ def build_portfolio_html(
   .page-actions a.primary {{
     background: rgba(59,130,246,0.18); border-color: rgba(59,130,246,0.45); color: #93c5fd;
   }}
-  /* 顶部 KPI：四卡等宽，标签 / 主数 / 副行 */
+  /* 顶部 KPI：四个合并信息组，桌面端保持单行 */
   .grid {{
-    display: grid; gap: 12px; margin-bottom: 20px;
+    display: grid; gap: 10px; margin-bottom: 20px;
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }}
-  @media (max-width: 900px) {{
-    .grid {{ grid-template-columns: 1fr 1fr; }}
+  @media (max-width: 960px) {{
+    .grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
   }}
   @media (max-width: 520px) {{
     .grid {{ grid-template-columns: 1fr; }}
   }}
   .card {{
     background: var(--card); border: 1px solid var(--border); border-radius: 12px;
-    padding: 16px 18px; min-height: 108px; min-width: 0;
+    padding: 15px 17px; min-height: 112px; min-width: 0;
+    display: flex; flex-direction: column;
   }}
-  .card .label {{ color: var(--muted); font-size: 0.75rem; letter-spacing: 0.02em; }}
-  .card .value {{ font-size: 1.25rem; font-weight: 650; margin-top: 6px; font-variant-numeric: tabular-nums; }}
-  .kpi-main {{
-    margin-top: 10px; font-size: 1.45rem; font-weight: 700; line-height: 1.2;
-    font-variant-numeric: tabular-nums; letter-spacing: -0.02em;
+  .grid > .card {{
+    position: relative; overflow: hidden; min-height: 112px; padding: 13px 16px;
+    background: #192332;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.018);
   }}
-  .kpi-sub {{
-    margin-top: 8px; font-size: 0.8rem; color: var(--muted); line-height: 1.4;
+  .grid > .card::before {{
+    content: ""; position: absolute; inset: 0 18px auto; height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(96,165,250,0.42), transparent);
+  }}
+  .summary-label {{
+    color: #91a1b8; font-size: 0.7rem; font-weight: 620;
+    letter-spacing: 0.045em; line-height: 1.2;
+  }}
+  .summary-head {{
+    color: #aab7c9; font-size: 0.72rem; font-weight: 650;
+    letter-spacing: 0.055em; margin-bottom: 10px;
+  }}
+  .summary-pair {{
+    display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start; min-width: 0;
+  }}
+  .summary-item {{ min-width: 0; padding-right: 16px; }}
+  .summary-item + .summary-item {{
+    padding-left: 16px; padding-right: 0;
+    border-left: 1px solid rgba(139,155,180,0.16);
+  }}
+  .summary-line {{
+    display: flex; align-items: baseline; gap: 9px; min-width: 0; margin-top: 7px;
     font-variant-numeric: tabular-nums;
   }}
-  .kpi-sub .sep {{ margin: 0 0.35em; opacity: 0.55; }}
-  .kpi-main.up, .kpi-sub.up {{ color: var(--up); }}
-  .kpi-main.down, .kpi-sub.down {{ color: var(--down); }}
-  .kpi-main.flat, .kpi-sub.flat {{ color: var(--muted); }}
+  .summary-value {{
+    color: #dfe7f2; font-size: 1.16rem; font-weight: 680; line-height: 1.2;
+    letter-spacing: -0.018em; white-space: nowrap;
+  }}
+  .summary-pct {{
+    color: var(--muted); font-size: 0.75rem; font-weight: 600; white-space: nowrap;
+  }}
+  .summary-meta {{
+    margin-top: auto; padding-top: 7px; color: var(--muted); font-size: 0.7rem;
+    line-height: 1.3; font-variant-numeric: tabular-nums;
+  }}
+  .summary-value.up, .summary-pct.up {{ color: var(--up); }}
+  .summary-value.down, .summary-pct.down {{ color: var(--down); }}
+  .summary-value.flat, .summary-pct.flat {{ color: var(--muted); }}
+  .summary-meta .sep {{ margin: 0 0.3em; opacity: 0.55; }}
+  @media (max-width: 380px) {{
+    .summary-item {{ padding-right: 10px; }}
+    .summary-item + .summary-item {{ padding-left: 10px; }}
+    .summary-value {{ font-size: 1.06rem; }}
+  }}
   /* 合并指标（其它区块仍可能用到） */
   .metric-stack {{ margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }}
   .metric-line {{
@@ -497,7 +1004,8 @@ def build_portfolio_html(
   /* 金额：默认「万」，点击切换精确「元」；涨跌色需盖过默认色 */
   button.money-toggle {{
     appearance: none; border: none; background: transparent; padding: 0; margin: 0;
-    cursor: pointer; color: inherit; font: inherit; text-align: inherit;
+    cursor: pointer; color: inherit; font-family: inherit;
+    text-align: inherit; white-space: nowrap;
     border-bottom: 1px dashed rgba(139,155,180,0.45);
   }}
   button.money-toggle.up {{ color: var(--up) !important; }}
@@ -533,6 +1041,21 @@ def build_portfolio_html(
   tr:hover td {{ background: rgba(59,130,246,0.06); }}
   .num {{ text-align: right; font-variant-numeric: tabular-nums; }}
   .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; }}
+  .stock-link {{
+    display: inline-flex; align-items: center; gap: 4px;
+    color: inherit; text-decoration: none; font-weight: 550;
+    transition: color .15s ease;
+  }}
+  .stock-link-arrow {{
+    color: var(--muted); font-size: 0.68rem; line-height: 1;
+    opacity: 0.55; transform: translateY(-1px);
+    transition: opacity .15s ease, transform .15s ease;
+  }}
+  .stock-link:hover {{ color: #93c5fd; }}
+  .stock-link:hover .stock-link-arrow {{ opacity: 1; transform: translate(1px, -2px); }}
+  .stock-link:focus-visible {{
+    outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px;
+  }}
   .up {{ color: var(--up); }}
   .down {{ color: var(--down); }}
   .flat {{ color: var(--muted); }}
@@ -587,32 +1110,72 @@ def build_portfolio_html(
       <a href="/history">历史</a>
     </nav>
   </div>
+  <p id="refresh-status" class="sub" role="status" aria-live="polite" hidden></p>
   <p class="sub">生成时间 {now.strftime("%Y-%m-%d %H:%M:%S")} · 数据来自 holdings.toml + 实时行情 · 不构成投资建议</p>
 
-  <div class="grid">
+  <div class="grid" aria-label="账户概览">
     <div class="card">
-      <div class="label">总资产 <span class="hint-unit">点击金额切换万/元</span></div>
-      {_money_toggle(total_assets if total_assets is not None else total_mv, css="kpi-main")}
-      <div class="kpi-sub">
-        市值 {_fmt_wan(total_mv)}<span class="sep">·</span>现金 {_fmt_wan(cash) if cash is not None else "—"}<span class="sep">·</span>仓位 {f"{float(position_ratio):.1f}%" if position_ratio is not None else "—"}
+      <div class="summary-head">资产与本金</div>
+      <div class="summary-pair">
+        <div class="summary-item">
+          <div class="summary-label">总资产</div>
+          <div class="summary-line">{_money_toggle(total_assets if total_assets is not None else total_mv, css="summary-value")}</div>
+        </div>
+        <div class="summary-item">
+          <div class="summary-label">入金成本</div>
+          <div class="summary-line">{_money_toggle(total_deposits, css="summary-value")}</div>
+        </div>
       </div>
     </div>
     <div class="card">
-      <div class="label">今日盈亏</div>
-      {_money_toggle(total_day_pnl, css=f"kpi-main {_cls_pnl(total_day_pnl)}", signed=True)}
-      <div class="kpi-sub {_cls_pnl(total_day_pnl_pct)}">{_fmt_pct(total_day_pnl_pct)}</div>
-    </div>
-    <div class="card">
-      <div class="label">浮盈亏</div>
-      {_money_toggle(total_pnl, css=f"kpi-main {_cls_pnl(total_pnl)}", signed=True)}
-      <div class="kpi-sub {_cls_pnl(total_pnl_pct)}">{_fmt_pct(total_pnl_pct)} · 成本 {_fmt_wan(total_cost)}</div>
-    </div>
-    <div class="card">
-      <div class="label">持仓</div>
-      <div class="kpi-main">{_e(pos_count)}</div>
-      <div class="kpi-sub">
-        <span class="up">涨 {n_up}</span><span class="sep">·</span><span class="flat">平 {n_flat}</span><span class="sep">·</span><span class="down">跌 {n_down}</span>
+      <div class="summary-head">资金分布</div>
+      <div class="summary-pair">
+        <div class="summary-item">
+          <div class="summary-label">股票市值</div>
+          <div class="summary-line"><span class="summary-value">{_fmt_wan(total_mv)}</span></div>
+        </div>
+        <div class="summary-item">
+          <div class="summary-label">现金</div>
+          <div class="summary-line"><span class="summary-value">{_fmt_wan(cash) if cash is not None else "—"}</span></div>
+        </div>
       </div>
+      <div class="summary-meta">当前仓位 {f"{float(position_ratio):.1f}%" if position_ratio is not None else "—"}</div>
+    </div>
+    <div class="card">
+      <div class="summary-head">收益</div>
+      <div class="summary-pair">
+        <div class="summary-item">
+          <div class="summary-label">今日盈亏</div>
+          <div class="summary-line">
+            {_money_toggle(total_day_pnl, css=f"summary-value {_cls_pnl(total_day_pnl)}", signed=True)}
+            <span class="summary-pct {_cls_pnl(total_day_pnl_pct)}">{_fmt_pct(total_day_pnl_pct)}</span>
+          </div>
+        </div>
+        <div class="summary-item">
+          <div class="summary-label">累计收益</div>
+          <div class="summary-line">
+            {_money_toggle(cumulative_pnl, css=f"summary-value {_cls_pnl(cumulative_pnl)}", signed=True)}
+            <span class="summary-pct {_cls_pnl(cumulative_pnl_pct)}">{_fmt_pct(cumulative_pnl_pct)}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="summary-head">持仓</div>
+      <div class="summary-pair">
+        <div class="summary-item">
+          <div class="summary-label">浮盈亏</div>
+          <div class="summary-line">
+            {_money_toggle(total_pnl, css=f"summary-value {_cls_pnl(total_pnl)}", signed=True)}
+            <span class="summary-pct {_cls_pnl(total_pnl_pct)}">{_fmt_pct(total_pnl_pct)}</span>
+          </div>
+        </div>
+        <div class="summary-item">
+          <div class="summary-label">持仓数量</div>
+          <div class="summary-line"><span class="summary-value">{_e(pos_count)} 只</span></div>
+        </div>
+      </div>
+      <div class="summary-meta"><span class="up">涨 {n_up}</span><span class="sep">·</span><span class="flat">平 {n_flat}</span><span class="sep">·</span><span class="down">跌 {n_down}</span></div>
     </div>
   </div>
 
@@ -698,6 +1261,10 @@ def build_portfolio_html(
       </table>
     </div>
   </div>
+
+  {chart_section}
+
+  {daily_chart_section}
 
   <div class="foot">
     TradeMind 本地报告 · 行情可能延迟或缺失 · 固定规则信号仅供参考，请结合自身风险承受力决策。
@@ -814,6 +1381,46 @@ def build_portfolio_html(
   syncHeader();
 }})();
 </script>
+<script>
+(function () {{
+  var status = document.getElementById("refresh-status");
+  var busy = false;
+  function show(message) {{ status.hidden = false; status.textContent = message; }}
+  function poll() {{
+    fetch("/health", {{ cache: "no-store" }})
+      .then(function (r) {{ return r.json(); }})
+      .then(function (state) {{
+        if (state.running) {{
+          show("正在后台生成，当前报告仍可查看…");
+          setTimeout(poll, 1000);
+        }} else if (state.last_error) {{
+          busy = false;
+          show("生成失败：" + state.last_error);
+        }} else {{
+          show("生成完成，正在更新报告…");
+          location.reload();
+        }}
+      }})
+      .catch(function () {{ setTimeout(poll, 2000); }});
+  }}
+  document.querySelectorAll('a[href="/refresh"], a[href="/refresh?full=1"]').forEach(function (link) {{
+    link.addEventListener("click", function (event) {{
+      event.preventDefault();
+      if (busy) return;
+      busy = true;
+      show("正在启动后台生成…");
+      var full = link.getAttribute("href").indexOf("full=1") !== -1;
+      fetch("/refresh?full=" + (full ? "1" : "0"), {{ cache: "no-store" }})
+        .then(function (r) {{ if (!r.ok) throw new Error("HTTP " + r.status); }})
+        .then(function () {{ poll(); }})
+        .catch(function (error) {{ busy = false; show("启动失败：" + error.message); }});
+    }});
+  }});
+  fetch("/health", {{ cache: "no-store" }})
+    .then(function (r) {{ return r.json(); }})
+    .then(function (state) {{ if (state.running) {{ busy = true; poll(); }} }});
+}})();
+</script>
 </body>
 </html>
 """
@@ -841,11 +1448,12 @@ def collect_report_data(
         portfolio_risk_from,
     )
 
-    from portfolio import load_cash
+    from portfolio import load_cash, load_total_deposits
 
     t0 = time.time()
     positions = load_positions()
     cash = load_cash()
+    total_deposits = load_total_deposits()
     codes = [p.code for p in positions]
     quotes = get_quotes(codes) if codes else []
     t_quote = time.time() - t0
@@ -857,6 +1465,7 @@ def collect_report_data(
         "signals": None,
         "market": None,
         "discipline": None,
+        "total_deposits": total_deposits,
         "_timing": {"quote_s": round(t_quote, 3)},
     }
     if include_signals:
@@ -873,13 +1482,32 @@ def collect_report_data(
         try:
             from tools.review import collect_daily_review
 
-            rev = collect_daily_review(include_fundamentals_scan=False)
+            rev = collect_daily_review(
+                include_fundamentals_scan=False, positions=positions, quotes=quotes, cash=cash
+            )
             out["market"] = rev.get("market")
+            if isinstance(out["market"], dict):
+                out["market"]["_as_of"] = rev.get("as_of")
             out["discipline"] = rev.get("discipline")
+            try:
+                cache_file = _reports_dir() / "market_latest.json"
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                cache_file.write_text(
+                    json.dumps({"market": out["market"]}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except OSError as e:
+                print(f"[report] market cache write failed: {e}")
         except Exception as e:
             out["market"] = {"error": str(e)}
             out["discipline"] = {"warnings": [f"市场复盘失败: {e}"]}
         out["_timing"]["market_s"] = round(time.time() - t2, 3)
+    else:
+        try:
+            cached = json.loads((_reports_dir() / "market_latest.json").read_text(encoding="utf-8"))
+            out["market"] = cached.get("market")
+        except (OSError, ValueError):
+            pass
     out["_timing"]["total_s"] = round(time.time() - t0, 3)
     return out
 
@@ -898,6 +1526,7 @@ def write_portfolio_report(
         include_market=include_market,
         days=days,
     )
+    print(f"[report] timing {data['_timing']}")
     now = datetime.now()
     html_str = build_portfolio_html(
         data["overview"],
@@ -907,6 +1536,7 @@ def write_portfolio_report(
         generated_at=now,
         market=data.get("market"),
         discipline=data.get("discipline"),
+        total_deposits=data.get("total_deposits"),
     )
     reports_dir = Path(__file__).resolve().parent.parent / "notes" / "reports"
     if path is None:

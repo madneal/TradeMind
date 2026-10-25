@@ -22,7 +22,7 @@ cp .env.example .env
 # 编辑 .env：XAI_API_KEY=...（默认 xAI Grok）
 
 # 3. 持仓（个人文件，已 gitignore）
-# 编辑 holdings.toml：positions + cash
+# 编辑 holdings.toml：positions + cash + total_deposits（累计净入金）
 # 现金口径：cash = Σ(各户总资产 − 持仓表市值合计)，含逆回购
 
 # 4. 常用
@@ -163,6 +163,9 @@ uv run trademind chat "分析一下持仓风险"
 ```text
 cash = Σ(账户总资产 − 该户持仓表「市值」之和)
 ```
+
+`total_deposits` 是累计净入金成本，仅在新增入金或出金时调整。报告中的
+“累计收益”按 `总资产 − total_deposits` 计算，与持仓成本口径的“浮盈亏”并列展示。
 
 持仓表只有股票/ETF；逆回购等不在表内、但在总资产里，差额全部计入现金。  
 不要用「总资产 − 左侧总市值」——左侧总市值可能已含逆回购，会漏算现金。

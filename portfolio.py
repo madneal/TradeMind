@@ -2,6 +2,7 @@
 
 持仓文件格式 (holdings.toml):
     cash = 10000.0          # 可选：可用/资金余额（元）
+    total_deposits = 500000 # 可选：账户累计净入金（元）
 
     [[positions]]
     code = "600519"
@@ -25,9 +26,10 @@ class Position:
     code: str          # 6 位代码
     shares: int        # 持仓股数
     cost_price: float  # 买入成本价
+    opened_on: str | None = None  # 全部仓位建仓日（YYYY-MM-DD）
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        return {k: v for k, v in asdict(self).items() if v is not None}
 
 
 def _load_raw(path: Path) -> dict:
@@ -49,6 +51,18 @@ def load_cash(path: Path | str | None = None) -> float | None:
         return None
 
 
+def load_total_deposits(path: Path | str | None = None) -> float | None:
+    """读取账户累计净入金；未配置则返回 None。"""
+    path = Path(path or HOLDINGS_PATH)
+    data = _load_raw(path)
+    if "total_deposits" not in data:
+        return None
+    try:
+        return float(data["total_deposits"])
+    except (TypeError, ValueError):
+        return None
+
+
 def load_positions(path: Path | str | None = None) -> list[Position]:
     """从 TOML 读取持仓列表。文件不存在返回空列表。"""
     path = Path(path or HOLDINGS_PATH)
@@ -60,6 +74,7 @@ def load_positions(path: Path | str | None = None) -> list[Position]:
                 code=normalize_code(p["code"]),
                 shares=int(p["shares"]),
                 cost_price=float(p["cost_price"]),
+                opened_on=str(p["opened_on"]) if p.get("opened_on") else None,
             )
         )
     return positions
@@ -82,6 +97,8 @@ def save_positions(
         data["cash"] = float(cash)
     elif "cash" in existing:
         data["cash"] = existing["cash"]
+    if "total_deposits" in existing:
+        data["total_deposits"] = existing["total_deposits"]
     with open(path, "wb") as f:
         tomli_w.dump(data, f)
 
