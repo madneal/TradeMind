@@ -23,7 +23,7 @@ def _get_client() -> OpenAI:
         if not XAI_API_KEY:
             raise RuntimeError(
                 "未配置 XAI_API_KEY，请在 .env 中设置（参考 .env.example）\n"
-                "申请地址：https://console.x.ai"
+                "智谱申请地址：https://open.bigmodel.cn（xAI：https://console.x.ai）"
             )
         _client = OpenAI(api_key=XAI_API_KEY, base_url=XAI_BASE_URL)
     return _client

@@ -2,8 +2,9 @@
 
 数据源选型：
 - 历史K线：首选 mootdx/通达信 TCP（快、不封 IP，对齐 a-stock-data）；
-  备选东财 stock_zh_a_hist；再备选新浪 stock_zh_a_daily
-  （新浪依赖 py_mini_racer，进程内串行，避免 macOS 并发 SIGTRAP）
+  备选东财 stock_zh_a_hist；再备选腾讯 fqkline（纯 HTTP 前复权）；
+  新浪日线 JSON（纯 HTTP 不复权）；最后新浪 stock_zh_a_daily
+  （依赖 py_mini_racer/V8，库在部分 macOS 上损坏，仅作兜底）
 - 实时行情：新浪 hq.sinajs.cn，失败降级到腾讯 qt.gtimg.cn，再降级到最近K线收盘价
 
 统一处理 A 股代码归一化、缓存、重试。
@@ -224,6 +225,102 @@ def _kline_from_sina(
         return None
 
 
+# 腾讯 fqkline 周期映射
+_TENCENT_PERIOD = {"daily": "day", "week": "week", "weekly": "week", "month": "month", "monthly": "month"}
+
+
+def _kline_from_tencent_http(
+    code: str, period: str, days: int, adjust: str
+) -> pd.DataFrame | None:
+    """腾讯前复权日线（纯 HTTP JSON，不依赖 MiniRacer）。
+
+    web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600519,day,,,320,qfq
+    返回 data.sh600519.qfqday = [[date, open, close, high, low, volume], ...]
+    注意字段顺序：close 在 high/low 之前。
+    失败返回 None。
+    """
+    tperiod = _TENCENT_PERIOD.get(period)
+    if tperiod is None:
+        return None
+    sym = _to_sina_symbol(code)
+    # 多取 1.6 倍自然日覆盖节假日，再按交易日截断
+    count = min(int(days * 1.8) + 30, 640)
+    fq = {"qfq": "qfq", "hfq": "hfq"}.get(adjust, "")
+    param = f"{sym},{tperiod},,,{count},{fq}".rstrip(",")
+    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={param}"
+    try:
+        resp = _retry(requests.get, url, timeout=10)
+        data = resp.json()
+        node = data.get("data", {}).get(sym, {})
+        rows = node.get(f"{fq}day" if fq else "day")
+        if not rows:
+            return None
+        # 兼容少数返回里每行末尾多带一个 dict 附注的情况
+        records = []
+        for r in rows:
+            if len(r) < 6:
+                continue
+            records.append(
+                {
+                    "date": r[0],
+                    "open": float(r[1]),
+                    "close": float(r[2]),
+                    "high": float(r[3]),
+                    "low": float(r[4]),
+                    "volume": float(r[5]),
+                }
+            )
+        if not records:
+            return None
+        return pd.DataFrame(records)
+    except Exception:
+        return None
+
+
+def _kline_from_sina_http(code: str, days: int) -> pd.DataFrame | None:
+    """新浪日线 JSON（纯 HTTP，不复权，不依赖 MiniRacer）。仅日线。失败返回 None。
+
+    quotes.sina.cn/cn/api/jsonp_v2.php/.../CN_MarketDataService.getKLineData
+    返回 var _=([{day,open,high,low,close,volume}, ...])
+    """
+    sym = _to_sina_symbol(code)
+    count = min(int(days * 1.8) + 30, 1023)
+    url = (
+        "https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20_=/CN_MarketDataService.getKLineData"
+        f"?symbol={sym}&scale=240&ma=no&datalen={count}"
+    )
+    try:
+        resp = _retry(
+            requests.get,
+            url,
+            headers={"Referer": "https://finance.sina.com.cn"},
+            timeout=10,
+        )
+        m = re.search(r"\((\[.*\])\)", resp.text, flags=re.S)
+        if not m:
+            return None
+        import json as _json
+
+        rows = _json.loads(m.group(1))
+        records = [
+            {
+                "date": r["day"],
+                "open": float(r["open"]),
+                "high": float(r["high"]),
+                "low": float(r["low"]),
+                "close": float(r["close"]),
+                "volume": float(r["volume"]),
+            }
+            for r in rows
+            if all(k in r for k in ("day", "open", "high", "low", "close", "volume"))
+        ]
+        if not records:
+            return None
+        return pd.DataFrame(records)
+    except Exception:
+        return None
+
+
 def get_kline(
     code: str, period: str = "daily", days: int = 60, adjust: str = "qfq"
 ) -> pd.DataFrame:
@@ -261,7 +358,19 @@ def get_kline(
         if em is not None and not em.empty:
             df = em
 
-    # 3) 新浪日线（串行 MiniRacer）
+    # 3) 腾讯 fqkline（纯 HTTP，前/后复权，无 MiniRacer 依赖）
+    if df is None or len(df) < min(days, 5):
+        tx = _kline_from_tencent_http(code, period, days, adjust)
+        if tx is not None and not tx.empty:
+            df = tx
+
+    # 4) 新浪日线 JSON（纯 HTTP，不复权，无 MiniRacer 依赖）
+    if (df is None or len(df) < min(days, 5)) and period == "daily":
+        sh = _kline_from_sina_http(code, days)
+        if sh is not None and not sh.empty:
+            df = sh
+
+    # 5) 新浪日线（串行 MiniRacer；库损坏时为死路径，留作兜底）
     if (df is None or len(df) < min(days, 5)) and period == "daily":
         sina = _kline_from_sina(code, start, end, adjust)
         if sina is not None and not sina.empty:
